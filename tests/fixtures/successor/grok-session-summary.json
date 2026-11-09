@@ -1,0 +1,24 @@
+{
+  "info": {
+    "id": "b6e7e486-5940-45eb-972f-9ccc40374f0b",
+    "cwd": "/work"
+  },
+  "agent_id": "ag1.9e1b0c527f70401ba6a7fe3158e93983",
+  "attempt_id": "at1.355ba001ee7646d28e25cf94fec80cbd",
+  "session_summary": "User requests single-word \"ok\" reply",
+  "created_at": "2026-09-15T02:34:31.359216Z",
+  "updated_at": "2026-09-15T02:34:39.566351Z",
+  "num_messages": 8,
+  "num_chat_messages": 11,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "session_kind": "headless",
+  "request_id": "e3c76291-ab12-4339-b696-9ccddbc297b1",
+  "grok_home": "/home/user/.grok",
+  "last_active_at": "2026-09-15T02:34:39.566351Z",
+  "generated_title": "User requests single-word \"ok\" reply",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "strict",
+  "reasoning_effort": "low"
+}

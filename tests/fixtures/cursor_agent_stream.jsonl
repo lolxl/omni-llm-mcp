@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/private/tmp/omni-cursor-probe.cOHb","session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140","model":"Composer 2.5","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Reply with the single word: pong"}]},"session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140"}
+{"type":"thinking","subtype":"delta","text":"The user requested a","session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140","timestamp_ms":1788983348165}
+{"type":"thinking","subtype":"delta","text":" single-word reply: ","session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140","timestamp_ms":1788983348167}
+{"type":"thinking","subtype":"delta","text":"pong.","session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140","timestamp_ms":1788983348167}
+{"type":"thinking","subtype":"completed","session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140","timestamp_ms":1788983348167}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"pong"}]},"session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140"}
+{"type":"result","subtype":"success","duration_ms":3993,"duration_api_ms":3993,"is_error":false,"result":"pong","session_id":"0cde3727-f578-46bd-8e43-4f11e35c6140","request_id":"7667a1a5-1b9e-469b-aba7-c6b7774f9b51","usage":{"inputTokens":22198,"outputTokens":37,"cacheReadTokens":576,"cacheWriteTokens":0}}

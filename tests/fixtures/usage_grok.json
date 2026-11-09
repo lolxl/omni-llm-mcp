@@ -1,0 +1,28 @@
+{
+  "modelUsage": {
+    "grok-4.5-build": {
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 4864,
+      "costUSD": 0.0,
+      "inputTokens": 8305,
+      "modelCalls": 1,
+      "outputTokens": 29
+    }
+  },
+  "num_turns": 1,
+  "requestId": "scrubbed",
+  "sessionId": "scrubbed",
+  "stopReason": "end_turn",
+  "text": "ok",
+  "thought": "scrubbed",
+  "total_cost_usd": 0.0,
+  "total_cost_usd_ticks": 0,
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 4864,
+    "input_tokens": 8305,
+    "output_tokens": 29,
+    "reasoning_tokens": 24,
+    "total_tokens": 13198
+  }
+}

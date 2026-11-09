@@ -1,0 +1,178 @@
+{
+  "baseline_schema_version": 1,
+  "commit": "287db9938bc6ef8f1c9cf5fd41fb46ecc7ca58df",
+  "fixture_hashes": {
+    "big_context": "3fb5efe707a173bca3939a81886fb97e3aed1e8cbef0d05a22959f2206363cfc",
+    "consultation": "d310e4777339a1f9a30ded225d3d8dc969db4e968bc46286d8f6ebec8e0d5c6c",
+    "fallback_chain": "7a9a6a30237a7d11911887e8047cdd08d90563df09fc1ae3f832bff1f8ac4097",
+    "large_result": "00bfb7e6a4e496e81efcc125c917789ea1971420848cd971cf689cfd4e9de014"
+  },
+  "history": [
+    {
+      "commit": "3a0bf6b80c89ca183e2cedb8014735f2c60ab8c0",
+      "reason": "P1.2b: usage fold-in + history",
+      "tools_compact_bytes": 10643,
+      "tools_list_wire_bytes": {
+        "legacy": 11215,
+        "modern": 11215
+      }
+    },
+    {
+      "commit": "0a2150b0fa29be9c484d08895a7964b3b78ffdad",
+      "reason": "P1.3: description shortening",
+      "tools_compact_bytes": 7821,
+      "tools_list_wire_bytes": {
+        "legacy": 8393,
+        "modern": 8393
+      }
+    },
+    {
+      "commit": "9d80b56d5fd7ff44a73f83f148f78eaa01ce117f",
+      "reason": "P1.3 review round: restore choice-time semantics (M3-M6/N1) + pin codex warning",
+      "tools_compact_bytes": 8094,
+      "tools_list_wire_bytes": {
+        "legacy": 8666,
+        "modern": 8666
+      }
+    },
+    {
+      "commit": "2cfc78766f66b1a0bfe4c08951e223cdc3c58210",
+      "reason": "P1.4: opaque artifact references (result_mode ref/auto + large_result ref path)",
+      "tools_compact_bytes": 8944,
+      "tools_list_wire_bytes": {
+        "legacy": 9566,
+        "modern": 9566
+      }
+    },
+    {
+      "commit": "35f747e93d9de73762092c8872a488ca6a3f1a62",
+      "reason": "P1.4-fix2: result_mode description honesty (untrusted prior LLM output) grows tools list wire bytes",
+      "tools_compact_bytes": 9134,
+      "tools_list_wire_bytes": {
+        "legacy": 9756,
+        "modern": 9756
+      }
+    },
+    {
+      "commit": "9a486c4ae649a3c29972dd875b639f430fda0aa6",
+      "reason": "grok files= schema: labelled caps, refusal split, UTF-8 precondition",
+      "tools_compact_bytes": 9499,
+      "tools_list_wire_bytes": {
+        "legacy": 10131,
+        "modern": 10131
+      }
+    },
+    {
+      "commit": "94edc8c4d04d957d6fa863823d3d52c02b0a4d6f",
+      "reason": "issue 72 PR-C: seat output field and require_read_wall input change the compact TOOLS projection",
+      "tools_compact_bytes": 9487,
+      "tools_list_wire_bytes": {
+        "legacy": 10135,
+        "modern": 10135
+      }
+    },
+    {
+      "commit": "a615fe2df839a14b3ed4cc9ae293a7f683cba7e9",
+      "reason": "issue 72 PR-C: restore the artifact-read hint in result_mode; compact 9469",
+      "tools_compact_bytes": 9469,
+      "tools_list_wire_bytes": {
+        "legacy": 10117,
+        "modern": 10117
+      }
+    },
+    {
+      "commit": "23e7f3e8f987430fad9811954dbf8d706b4f6a46",
+      "reason": "agy effort capability in the published tool schema",
+      "tools_compact_bytes": 9467,
+      "tools_list_wire_bytes": {
+        "legacy": 10115,
+        "modern": 10115
+      }
+    },
+    {
+      "commit": "287db9938bc6ef8f1c9cf5fd41fb46ecc7ca58df",
+      "reason": "server version 0.10.0 in serverInfo",
+      "tools_compact_bytes": 9467,
+      "tools_list_wire_bytes": {
+        "legacy": 10116,
+        "modern": 10116
+      }
+    }
+  ],
+  "p12a_reference": {
+    "commit": "f04528638f42181aafe10ad5ff229bd10ee13a50",
+    "tools_compact_bytes": 9625,
+    "tools_list_wire_bytes": {
+      "legacy": 10111,
+      "modern": 10111
+    }
+  },
+  "paths": {
+    "big_context": {
+      "attempts": 1,
+      "checker": "pass",
+      "fallback_count": 0,
+      "latency_ms": 1.243,
+      "ok": true
+    },
+    "consultation": {
+      "attempts": 1,
+      "checker": "pass",
+      "fallback_count": 0,
+      "latency_ms": 1.107,
+      "ok": true
+    },
+    "fallback_chain": {
+      "attempts": 2,
+      "checker": "pass",
+      "fallback_count": 1,
+      "latency_ms": 1.419,
+      "ok": true
+    },
+    "large_result": {
+      "attempts": 1,
+      "checker": "pass",
+      "fallback_count": 0,
+      "latency_ms": 2.29,
+      "ok": true
+    }
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "python_version": "3.9.6",
+  "tools_compact_bytes": 9467,
+  "tools_list_wire_bytes": {
+    "legacy": 10116,
+    "modern": 10116
+  },
+  "update_reason": "server version 0.10.0 in serverInfo",
+  "usage": {
+    "big_context": {
+      "cache_write_tokens": 0,
+      "cached_input_tokens": 128,
+      "input_tokens": 640,
+      "output_tokens": 12,
+      "source": "provider"
+    },
+    "consultation": {
+      "cache_write_tokens": 0,
+      "cached_input_tokens": 0,
+      "input_tokens": 42,
+      "output_tokens": 7,
+      "source": "provider"
+    },
+    "fallback_chain": {
+      "cache_write_tokens": 0,
+      "cached_input_tokens": 0,
+      "input_tokens": 8,
+      "output_tokens": 3,
+      "source": "provider"
+    },
+    "large_result": {
+      "cache_write_tokens": 0,
+      "cached_input_tokens": 0,
+      "input_tokens": 20,
+      "output_tokens": 4000,
+      "source": "provider"
+    }
+  }
+}

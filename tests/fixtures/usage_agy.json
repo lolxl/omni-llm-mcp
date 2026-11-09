@@ -1,0 +1,14 @@
+{
+  "conversation_id": "scrubbed",
+  "duration_seconds": 2.45464,
+  "num_turns": 1,
+  "response": "ok\n",
+  "status": "SUCCESS",
+  "usage": {
+    "cache_read_tokens": 0,
+    "input_tokens": 17238,
+    "output_tokens": 10,
+    "thinking_tokens": 0,
+    "total_tokens": 17248
+  }
+}

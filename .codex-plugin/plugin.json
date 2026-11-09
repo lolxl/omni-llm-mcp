@@ -1,0 +1,19 @@
+{
+  "name": "omni-llm",
+  "version": "0.10.0",
+  "description": "Zero-dependency MCP server that puts Codex, Claude Code, Grok, Cursor, Antigravity, Pi, OpenAI and local LLMs behind one interface: llm_generate, llm_big_context, llm_image, list_models.",
+  "author": {
+    "name": "lolxl",
+    "url": "https://github.com/lolxl"
+  },
+  "homepage": "https://github.com/lolxl/omni-llm-mcp",
+  "repository": "https://github.com/lolxl/omni-llm-mcp",
+  "license": "Apache-2.0",
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "omni-llm",
+    "shortDescription": "Consult many LLM backends through one MCP server",
+    "developerName": "lolxl",
+    "category": "Development"
+  }
+}

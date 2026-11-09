@@ -1,0 +1,26 @@
+{
+  "path": "big_context",
+  "tool": "llm_big_context",
+  "arguments": {
+    "instruction": "Extract the MAGIC_TOKEN value from the source. Reply with exactly BIG_OK:<token> and nothing else.",
+    "text": "public source preamble\nline-a\nMAGIC_TOKEN=alpha42\nline-b\nend of source",
+    "model": "bench/big"
+  },
+  "fake_replies": {
+    "bench/big": {
+      "ok": true,
+      "text": "BIG_OK:alpha42",
+      "model": "bench/big",
+      "usage_backend": "grok",
+      "usage_raw": {
+        "input_tokens": 512,
+        "cache_read_input_tokens": 128,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 12
+      }
+    }
+  },
+  "expected_text": "BIG_OK:alpha42",
+  "expected_attempts": 1,
+  "expected_fallback_count": 0
+}

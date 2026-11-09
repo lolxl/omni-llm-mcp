@@ -1,0 +1,25 @@
+{
+  "path": "consultation",
+  "tool": "llm_generate",
+  "arguments": {
+    "prompt": "What is 6 times 7? Reply with exactly CONSULT_OK:42 and nothing else.",
+    "model": "bench/consult"
+  },
+  "fake_replies": {
+    "bench/consult": {
+      "ok": true,
+      "text": "CONSULT_OK:42",
+      "model": "bench/consult",
+      "usage_backend": "grok",
+      "usage_raw": {
+        "input_tokens": 42,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 7
+      }
+    }
+  },
+  "expected_text": "CONSULT_OK:42",
+  "expected_attempts": 1,
+  "expected_fallback_count": 0
+}

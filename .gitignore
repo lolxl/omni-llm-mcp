@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+bench/live-report.json
+
+# graphify derived index (stays local, gitignored)
+graphify-out/
+
+# Harness residue, never repo content. A plugin host that fails to expand
+# CLAUDE_PLUGIN_DATA creates a directory named after the literal variable
+# in whatever cwd it started in -- including a worktree. It reached main
+# once through `git add -A`.
+${CLAUDE_PLUGIN_DATA}/

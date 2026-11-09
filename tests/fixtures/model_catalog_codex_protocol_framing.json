@@ -1,0 +1,36 @@
+[
+  {
+    "keys": [
+      "id",
+      "result"
+    ],
+    "method": null,
+    "has_id": true,
+    "id_type": "int",
+    "has_result": true,
+    "has_error": false
+  },
+  {
+    "keys": [
+      "method",
+      "params",
+      "emittedAtMs"
+    ],
+    "method": "remoteControl/status/changed",
+    "has_id": false,
+    "id_type": "NoneType",
+    "has_result": false,
+    "has_error": false
+  },
+  {
+    "keys": [
+      "id",
+      "result"
+    ],
+    "method": null,
+    "has_id": true,
+    "id_type": "int",
+    "has_result": true,
+    "has_error": false
+  }
+]

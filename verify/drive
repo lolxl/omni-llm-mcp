@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# no-opencc
+"""Isolated MCP stdio drive: launch → one user-facing tools/call → oracle → cleanup.
+
+Launch server.py over stdio with a blank PATH and a private OMNI_LLM_STATE_DIR
+so the round-trip never rides the operator's CLI logins, API keys, or
+~/.local/state/omni-llm. The user-facing call is list_models (same hermetic
+path as tests.test_server.test_list_models_cli_missing_is_loud).
+
+Pass/fail is the LOUD envelope shape under that isolation:
+  ok is false, reason is cli_missing, backends includes agy and grok.
+Exit 0 on pass, 1 on fail. --cleanup is idempotent and does not launch.
+
+Does not git add/commit/push/merge. Printed output is secret-masked.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+SERVER = os.path.join(REPO, "server.py")
+RUN_DIR = os.path.join(HERE, ".run")
+STATE_DIR = os.path.join(RUN_DIR, "state")
+PID_PATH = os.path.join(RUN_DIR, "server.pid")
+MARKER = "OMNI_LLM_DRIVE"
+
+# Oracle — mutate EXPECT_REASON to inject a red run (acceptance falsifier).
+EXPECT_PROTOCOL = "2025-06-18"
+EXPECT_SERVER_NAME = "omni-llm-mcp"
+EXPECT_REASON = "cli_missing"
+EXPECT_BACKENDS = ("agy", "grok")
+TIMEOUT_S = 30
+
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(^|_)(api[_-]?key|auth_?token|access_?token|refresh_?token|"
+    r"secret|password|passwd|credential|authorization)$"
+)
+_SECRET_VAL_RE = re.compile(
+    r"(?i)\b(sk-[A-Za-z0-9_-]{10,}|xai-[A-Za-z0-9_-]{10,}|"
+    r"Bearer\s+\S+|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})"
+)
+
+
+def mask(text):
+    """Redact token-shaped values before anything is printed."""
+    if not text:
+        return ""
+    return _SECRET_VAL_RE.sub("***", text)
+
+
+def emit(msg):
+    sys.stdout.write(mask(msg) + "\n")
+    sys.stdout.flush()
+
+
+def isolated_env():
+    """Minimal child env: no inherited keys/tokens, no user PATH, private state."""
+    env = {
+        "PATH": "/nonexistent",
+        "HOME": RUN_DIR,
+        "TMPDIR": RUN_DIR,
+        "PYTHONUNBUFFERED": "1",
+        "OMNI_LLM_STATE_DIR": STATE_DIR,
+        "OMNI_LLM_CODEX_SESSIONS_DIR": os.path.join(STATE_DIR, "codex-sessions"),
+        "OMNI_LLM_METRICS": "0",
+        MARKER: "1",
+    }
+    for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ"):
+        val = os.environ.get(key)
+        if val:
+            env[key] = val
+    # Drop anything secret-shaped that leaked into the keep-list (none should).
+    return {k: v for k, v in env.items() if not _SECRET_KEY_RE.search(k)}
+
+
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_pidfile():
+    try:
+        raw = open(PID_PATH, encoding="utf-8").read().strip()
+        return int(raw)
+    except (OSError, ValueError):
+        return None
+
+
+def cleanup():
+    """Idempotent: kill a leftover drive server, then drop verify/.run."""
+    pid = _read_pidfile()
+    if pid is not None and _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + 2
+        while time.time() < deadline and _pid_alive(pid):
+            time.sleep(0.05)
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass
+    if os.path.isdir(RUN_DIR):
+        shutil.rmtree(RUN_DIR, ignore_errors=True)
+    # Second rmtree is the idempotent proof for a vanished tree.
+    if os.path.isdir(RUN_DIR):
+        shutil.rmtree(RUN_DIR, ignore_errors=True)
+    leftover = os.path.exists(RUN_DIR)
+    return not leftover
+
+
+def _rpc(id_, method, params=None):
+    msg = {"jsonrpc": "2.0", "id": id_, "method": method}
+    if params is not None:
+        msg["params"] = params
+    return msg
+
+
+def _by_id(msgs, id_):
+    for msg in msgs:
+        if msg.get("id") == id_:
+            return msg
+    return None
+
+
+def _envelope(call_msg):
+    result = (call_msg or {}).get("result") or {}
+    payload = result.get("structuredContent")
+    if isinstance(payload, dict):
+        return payload, result
+    content = result.get("content") or []
+    if content and isinstance(content[0], dict) and content[0].get("type") == "text":
+        try:
+            parsed = json.loads(content[0].get("text") or "")
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed, result
+    return {}, result
+
+
+def oracle(msgs):
+    """Return (ok, reasons). reasons is a list of failed checks."""
+    failed = []
+    init = _by_id(msgs, 1)
+    if init is None:
+        failed.append("missing initialize response id=1")
+        return False, failed
+    if "error" in init:
+        failed.append("initialize error: %s" % init.get("error"))
+    else:
+        info = ((init.get("result") or {}).get("serverInfo") or {})
+        name = info.get("name")
+        if name != EXPECT_SERVER_NAME:
+            failed.append("serverInfo.name expected %r got %r" % (EXPECT_SERVER_NAME, name))
+        proto = (init.get("result") or {}).get("protocolVersion")
+        if proto != EXPECT_PROTOCOL:
+            failed.append("protocolVersion expected %r got %r" % (EXPECT_PROTOCOL, proto))
+
+    call = _by_id(msgs, 2)
+    if call is None:
+        failed.append("missing tools/call response id=2")
+        return False, failed
+    if "error" in call:
+        failed.append("tools/call jsonrpc error: %s" % call.get("error"))
+        return False, failed
+
+    payload, result = _envelope(call)
+    if payload.get("ok") is not False:
+        failed.append("envelope.ok expected False got %r" % (payload.get("ok"),))
+    reason = payload.get("reason")
+    if reason != EXPECT_REASON:
+        failed.append("envelope.reason expected %r got %r" % (EXPECT_REASON, reason))
+    backends = payload.get("backends")
+    if not isinstance(backends, dict):
+        failed.append("envelope.backends expected dict got %r" % (type(backends).__name__,))
+    else:
+        missing = [name for name in EXPECT_BACKENDS if name not in backends]
+        if missing:
+            failed.append("envelope.backends missing %s" % ",".join(missing))
+    if result.get("isError") is not True:
+        failed.append("result.isError expected True got %r" % (result.get("isError"),))
+    return not failed, failed
+
+
+def launch_and_call():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    env = isolated_env()
+    reqs = [
+        _rpc(1, "initialize", {
+            "protocolVersion": EXPECT_PROTOCOL,
+            "capabilities": {},
+            "clientInfo": {"name": "omni-llm-mcp-drive", "version": "0"},
+        }),
+        _rpc(2, "tools/call", {
+            "name": "list_models",
+            "arguments": {"timeout_s": 5},
+        }),
+    ]
+    payload = "".join(json.dumps(m, ensure_ascii=False) + "\n" for m in reqs)
+    proc = subprocess.Popen(
+        [sys.executable, SERVER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=REPO,
+        env=env,
+        text=True,
+    )
+    with open(PID_PATH, "w", encoding="utf-8") as handle:
+        handle.write("%d\n" % proc.pid)
+    emit("launch pid=%d server=%s state=%s" % (proc.pid, SERVER, STATE_DIR))
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(payload, timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        stdout, stderr = proc.communicate()
+    rc = proc.returncode
+    stdout = mask(stdout or "")
+    stderr = mask(stderr or "")
+    msgs = []
+    parse_errors = 0
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            msgs.append(json.loads(line))
+        except ValueError:
+            parse_errors += 1
+    return {
+        "pid": proc.pid,
+        "rc": rc,
+        "timed_out": timed_out,
+        "msgs": msgs,
+        "parse_errors": parse_errors,
+        "stderr_tail": stderr.strip().splitlines()[-8:],
+    }
+
+
+def drive():
+    cleanup()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        result = launch_and_call()
+    except Exception as exc:
+        emit("DRIVE FAIL launch: %s" % exc)
+        cleanup()
+        return 1
+
+    if result["timed_out"]:
+        emit("DRIVE FAIL server timed out after %ss" % TIMEOUT_S)
+        cleanup()
+        return 1
+    if result["parse_errors"]:
+        emit("DRIVE FAIL unparsable stdout lines=%d" % result["parse_errors"])
+        cleanup()
+        return 1
+
+    ok, failed = oracle(result["msgs"])
+    call = _by_id(result["msgs"], 2)
+    payload, _result = _envelope(call)
+    emit("response id=2 ok=%s reason=%s backends=%s isError=%s" % (
+        payload.get("ok"),
+        payload.get("reason"),
+        ",".join(sorted((payload.get("backends") or {}))),
+        (_result or {}).get("isError"),
+    ))
+    if result["stderr_tail"]:
+        emit("stderr_tail:")
+        for line in result["stderr_tail"]:
+            emit("  %s" % line)
+
+    if not ok:
+        emit("DRIVE FAIL")
+        for item in failed:
+            emit("  - %s" % item)
+        cleanup()
+        return 1
+
+    emit("DRIVE PASS oracle=list_models reason=%s server_exit=%s" % (
+        EXPECT_REASON, result["rc"]))
+    cleaned = cleanup()
+    emit("cleanup ok=%s run_dir_absent=%s" % (cleaned, not os.path.exists(RUN_DIR)))
+    return 0 if cleaned else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description="omni-llm-mcp isolated MCP drive")
+    parser.add_argument(
+        "--cleanup", action="store_true",
+        help="idempotent teardown of verify/.run (no launch)",
+    )
+    args = parser.parse_args()
+    if args.cleanup:
+        cleaned = cleanup()
+        emit("cleanup ok=%s run_dir_absent=%s" % (
+            cleaned, not os.path.exists(RUN_DIR)))
+        return 0 if cleaned else 1
+    return drive()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

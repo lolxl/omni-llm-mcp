@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "producer_flags": "agy -p '' --input-format stream-json --output-format stream-json --model gemini-4-argon-high --effort high",
+    "retained_shape": "init, ordered step_update events, and 21 cumulative terminal result events",
+    "retained_counts": {
+      "successful_results": 20,
+      "final_error_results": 1,
+      "receipt_acknowledgments": 20,
+      "agent_response_groups": 22,
+      "checkpoint_updates": 2,
+      "error_message_updates": 1
+    }
+  },
+  "sanitized_fields": [
+    "conversation IDs replaced with fixture-conversation",
+    "receipt markers replaced with ACK_01 through ACK_20",
+    "input and response prose replaced with neutral fixture tokens",
+    "partial response replaced with PARTIAL_OUTPUT_MUST_NOT_BE_PUBLISHED",
+    "step text, local paths, and unrelated frame fields omitted",
+    "usage quantities replaced with synthetic cumulative values"
+  ],
+  "synthetic_usage": "For terminal turn n: input=100*n, cache_read=20*n, output=10*n, thinking=1*n, total=130*n.",
+  "error_cause": "The stream was interrupted. Please continue the task you were working on."
+}

@@ -1,0 +1,28 @@
+{
+  "profiles": [
+    {
+      "road": "codex",
+      "name": "default",
+      "source": "default",
+      "state": "identity_cached",
+      "problems": [],
+      "identity": {"account_id_suffix": "xyz789"}
+    },
+    {
+      "road": "codex",
+      "name": "b",
+      "source": "env",
+      "state": "identity_cached",
+      "problems": [],
+      "identity": {"account_id_suffix": "abc123"}
+    },
+    {
+      "road": "claude",
+      "name": "default",
+      "source": "default",
+      "state": "identity_cached",
+      "problems": [],
+      "identity": {"emailAddress": "synth@example.test"}
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "path": "large_result",
+  "tool": "llm_generate",
+  "arguments": {
+    "prompt": "Emit a large deterministic body ending with LARGE_OK:deadbeef.",
+    "model": "bench/large",
+    "result_mode": "ref"
+  },
+  "fake_replies": {
+    "bench/large": {
+      "ok": true,
+      "model": "bench/large",
+      "text_prefix": "LARGE_BODY:",
+      "repeat_unit": "abcdefghijklmnopqrstuvwxyz0123456789\n",
+      "repeat_count": 400,
+      "text_suffix": "LARGE_OK:deadbeef",
+      "usage_backend": "grok",
+      "usage_raw": {
+        "input_tokens": 20,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 4000
+      }
+    }
+  },
+  "expected_marker": "LARGE_OK:deadbeef",
+  "expected_min_chars": 10000,
+  "expected_attempts": 1,
+  "expected_fallback_count": 0
+}

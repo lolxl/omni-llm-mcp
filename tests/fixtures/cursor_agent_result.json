@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":false,"duration_ms":8630,"duration_api_ms":8630,"result":"Creating `hello.txt` with exactly `hi`.\n已建立 `hello.txt`，內容為 `hi`。","session_id":"958cb0ca-e778-46e4-954d-38df2e65ecfd","request_id":"890f16d9-8df5-4023-a190-b06261598c0a","usage":{"inputTokens":14558,"outputTokens":160,"cacheReadTokens":54173,"cacheWriteTokens":0}}

@@ -1,0 +1,18 @@
+{
+  "usage": {
+    "input": 490,
+    "output": 2,
+    "cacheRead": 128,
+    "cacheWrite": 0,
+    "reasoning": 27,
+    "totalTokens": 620,
+    "cost": {
+      "input": 0.00098,
+      "output": 1.2e-05,
+      "cacheRead": 6.4e-05,
+      "cacheWrite": 0,
+      "total": 0.001056
+    }
+  },
+  "text": "PONG"
+}

@@ -1,0 +1,8 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 1234,
+  "result": "HI",
+  "session_id": "scrubbed"
+}
