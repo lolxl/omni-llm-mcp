@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-llm-mcp"
+dynamic = ["version"]
+description = "One MCP server and CLI (omni) for many LLM backends."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "lolxl" }]
+keywords = ["mcp", "llm", "codex", "claude", "grok", "cursor", "ollama"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/lolxl/omni-llm-mcp"
+
+# The wheel installs the CLI, whose `omni mcp` subcommand runs the MCP server from
+# providers/mcp_server.py. The server.py shim stays out of the wheel because a
+# top-level module named `server` would collide with unrelated packages; plugins
+# and clones launch server.py by path.
+[project.scripts]
+omni = "omni_cli:main"
+
+[tool.setuptools]
+py-modules = ["omni_cli"]
+packages = ["providers"]
+
+[tool.setuptools.dynamic]
+version = { attr = "providers.version.__version__" }

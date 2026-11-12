@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from providers import git_safe, host_fence
+from tests import offline_home
 
 _IDENTITY = ["-c", "user.email=t@example.invalid", "-c", "user.name=t"]
 
@@ -41,9 +42,15 @@ def _ref_format(repo):
 
 _STATE_PATCH = None
 _STATE_DIR = None
+_HOME = None
 
 
 def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
     # #168: a write-mode run records a repository's protected branches under the
     # state dir. Keep these fixtures' repositories out of the real one.
     global _STATE_PATCH, _STATE_DIR
@@ -54,13 +61,19 @@ def setUpModule():
 
 def tearDownModule():
     import shutil
-    _STATE_PATCH.stop()
-    shutil.rmtree(_STATE_DIR, ignore_errors=True)
+    try:
+        _STATE_PATCH.stop()
+        shutil.rmtree(_STATE_DIR, ignore_errors=True)
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 
 class _Base(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         tmp = tempfile.TemporaryDirectory(prefix="omni_refstore_", dir="/private/tmp")
         self.addCleanup(tmp.cleanup)
         self.root = os.path.realpath(tmp.name)

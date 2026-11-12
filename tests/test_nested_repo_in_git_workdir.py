@@ -27,13 +27,34 @@ from unittest import mock
 import omni_cli
 from providers import host_fence, known_secrets
 from tests.test_protected_refs import _IDENTITY, _Base, _git, _sh_quote
+from tests import offline_home
 
 DARWIN = platform.system() == "Darwin"
 _NO_USER_CONFIG = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
+
 class _NestedBase(_Base):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         super().setUp()
         patcher = mock.patch.dict(os.environ, _NO_USER_CONFIG)
         patcher.start()

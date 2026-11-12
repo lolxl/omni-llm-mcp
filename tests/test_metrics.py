@@ -489,9 +489,25 @@ for i in range(50):
 
     def test_llm_image_synthetic_seat(self):
         """F6: llm_image records a synthetic seat + attempt for the image backend."""
+        from providers import catalog_v2
+        from providers.catalog_record import validate_strict
+        from providers.grok_image_cli import GROK_IMAGE_MODEL
+        record, _warnings = validate_strict("grok", {
+            "provider": "grok",
+            "source": "live",
+            "observed_at": "2026-11-10T00:00:00Z",
+            "availability": "provider_advertised",
+            "models": [{
+                "id": GROK_IMAGE_MODEL,
+                "name": GROK_IMAGE_MODEL,
+                "routable_id": "grok/%s" % GROK_IMAGE_MODEL,
+                "supported_efforts": ["medium"],
+            }],
+        })
+        catalog_v2.save("grok", "default", record)
 
         async def fake_cli(prompt, source_image, timeout_s=None, out_dir=None,
-                           account_profile=None):
+                           account_profile=None, apply_aliases=False):
             return {
                 "ok": True, "text": "", "model": "grok-image-edit",
                 "images": ["fake.png"],

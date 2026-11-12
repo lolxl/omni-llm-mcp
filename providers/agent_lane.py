@@ -39,6 +39,7 @@ event to codex. The outer return code therefore does not decide ``ok`` — see
 ``_codex_run_failure``, which judges from the ``--json`` event stream and is
 never given a channel carrying caller- or agent-authored text.
 """
+import codecs
 import json
 import math
 import os
@@ -94,6 +95,7 @@ from providers.errors import (
     codex_safe_output,
     codex_classification_stderr,
     signal_exit_detail,
+    strip_signin_expiry_warning,
 )
 from providers.profiles import resolve_account_home, ACCOUNT_HOME_KEYS, resolve_profile, resolve_codex_home, spawn_env
 from providers import codex_accounts, provider_accounts
@@ -385,8 +387,12 @@ def _codex_run_failure(stdout_text):
     return None
 
 
-def _git(workdir, *args):
+def _git(workdir, *args, keep_lead=False):
     """One git query; returns (rc, stdout, stderr) — both streams stripped.
+
+    ``keep_lead=True`` strips only stdout's trailing whitespace: a porcelain
+    first line such as `` M path`` starts with a status space that ``.strip()``
+    would eat, truncating that path (issue #243).
 
     Any exception -> (None, "", "<message>"), which callers MUST treat as an
     indeterminate git state (fail closed), never as "not a repository".
@@ -402,7 +408,8 @@ def _git(workdir, *args):
     """
     try:
         p = git_safe.run_git(os.fspath(workdir), args)
-        return (p.returncode, (p.stdout or "").strip(),
+        out = p.stdout or ""
+        return (p.returncode, out.rstrip() if keep_lead else out.strip(),
                 redact_secrets((p.stderr or "").strip()))
     except Exception as e:
         return None, "", redact_secrets(str(e))[:120]
@@ -446,11 +453,61 @@ def _parse_porcelain(out):
     return entries
 
 
-def _workspace_snapshot(workdir):
-    """Porcelain entries plus HEAD, or why they could not be read (issue #65).
+def _unquote_porcelain_path(path):
+    """The real file name for a porcelain path that git C-quoted.
 
-    Returns ``{"state": "ok", "entries": {...}, "head": sha|None}``,
-    ``{"state": "not_git"}`` when the workdir is not a git tree, or
+    Git wraps a name with a space, a quote, a backslash or non-ASCII bytes in
+    double quotes and escapes it (``"a b.txt"``, octal escapes for bytes).
+    Any other path is returned unchanged. ``core.quotePath=false`` (raw UTF-8
+    bytes inside the quotes) is handled too.
+    """
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        inner = path[1:-1]
+        try:
+            raw = codecs.escape_decode(
+                inner.encode("utf-8", "surrogateescape"))[0]
+            return raw.decode("utf-8", "surrogateescape")
+        except Exception:
+            return path
+    return path
+
+
+def _path_fingerprint(workdir, path):
+    """Stat-based fingerprint of ``workdir/path`` without following a symlink.
+
+    Never reads file contents. ``"link:<target>"`` for a symlink, the tuple
+    ``(size, mtime_ns, ctime_ns, inode)`` for a regular file, else ``None``
+    (missing, directory, FIFO or other special file, unreadable, or a path that
+    is absolute or contains a ``..`` segment). A rewrite with the same bytes
+    changes mtime and ctime, so it counts as a write.
+    """
+    if (not path or os.path.isabs(path)
+            or ".." in path.replace("\\", "/").split("/")):
+        return None
+    full = os.path.join(workdir, path)
+    try:
+        st = os.lstat(full)
+        if stat.S_ISLNK(st.st_mode):
+            return "link:" + os.readlink(full)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+    except OSError:
+        return None
+
+
+def _workspace_snapshot(workdir):
+    """Porcelain entries, stat fingerprints and HEAD, or why they could not be read.
+
+    Returns ``{"state": "ok", "entries": {...}, "digests": {path: fp|None},
+    "head": sha|None}`` (issue #65; digests: issue #243). A fingerprint is the
+    tuple ``(size, mtime_ns, ctime_ns, inode)`` of a regular file taken from
+    ``lstat`` only (contents are never read), ``"link:<target>"`` for a symlink
+    (never followed), or ``None`` for a missing path, a directory or special
+    file, an unreadable path, or a path that is absolute or has a ``..``
+    segment. Fingerprints let a later comparison see a rewrite of a file that
+    was already dirty; a rewrite with the same bytes counts as a write. Other
+    results: ``{"state": "not_git"}`` when the workdir is not a git tree, or
     ``{"state": "error", "detail": ...}`` when git could not answer (timeout,
     corrupt index). Only ``not_git`` and ``error`` become
     ``workspace_writes: null``; they are reported apart so a slow or broken
@@ -460,10 +517,14 @@ def _workspace_snapshot(workdir):
     # reading the submodule's config and attributes; its moved HEAD is still
     # reported, its work-tree content is not (issue #157).
     rc, out, err = _git(workdir, "status", "--porcelain", "--untracked-files=all",
-                        "--ignore-submodules=dirty")
+                        "--ignore-submodules=dirty", keep_lead=True)
     if rc == 0:
         hrc, head, _herr = _git(workdir, "rev-parse", "--verify", "-q", "HEAD")
-        return {"state": "ok", "entries": _parse_porcelain(out),
+        entries = _parse_porcelain(out)
+        return {"state": "ok", "entries": entries,
+                "digests": {path: _path_fingerprint(
+                                workdir, _unquote_porcelain_path(path))
+                            for path in entries},
                 "head": head if hrc == 0 and head else None}
     if rc == 128 and "not a git repository" in (err or "").lower():
         return {"state": "not_git", "detail": "%s is not a git tree" % workdir}
@@ -472,9 +533,13 @@ def _workspace_snapshot(workdir):
 
 
 def _workspace_writes(workdir, before, after):
-    """``(count, unknown_detail)``: paths whose status changed, or why unknown.
+    """``(count, unknown_detail)``: paths changed, or why unknown.
 
-    A path counts once whatever happened to its status letters. When HEAD
+    A path is changed when its status letters differ between the snapshots, or
+    when it is dirty in both with the same letters but a different stat
+    fingerprint (an already-modified or untracked file rewritten, issue #243). A
+    snapshot without ``"digests"`` compares by letters only. A path counts once
+    whatever happened to it. When HEAD
     moved during the run (the agent committed), the files in that commit
     range are added, so "write then commit" is not mistaken for a no-op.
     """
@@ -483,6 +548,10 @@ def _workspace_writes(workdir, before, after):
             return None, snap.get("detail") or "workspace state unknown"
     b, a = before["entries"], after["entries"]
     changed = {path for path in set(b) | set(a) if b.get(path) != a.get(path)}
+    bd, ad = before.get("digests"), after.get("digests")
+    if isinstance(bd, dict) and isinstance(ad, dict):
+        changed |= {path for path in set(b) & set(a)
+                    if bd.get(path) != ad.get(path)}
     if before.get("head") and after.get("head") and before["head"] != after["head"]:
         rc, out, _err = _git(workdir, "diff", "--name-only",
                              "--no-ext-diff", "--no-textconv",
@@ -1417,7 +1486,7 @@ async def _run_agent_once(task, model, workdir, read_only=False,
                     effort=None, fence_requested=None, expect_writes=False,
                     foreman=False, permission_mode=None, account_home=None,
                     account_deadline=None, codex_auth_isolated=False, account_auth_isolated=False,
-                    account_home_explicit=True, pre_spawn=None):
+                    account_home_explicit=True, pre_spawn=None, admission=None):
     """Run one delegated agentic job; returns a typed envelope, never raises.
 
     ``pre_spawn`` (managed API selections) is the late gate check: a callable
@@ -1472,9 +1541,17 @@ async def _run_agent_once(task, model, workdir, read_only=False,
         read_only=bool(read_only))
     if perm_err:
         return _stamp_fence(perm_err)
-    resolved_effort, effort_err = effort_for_provider(provider, effort)
-    if effort_err:
-        return _stamp_fence(effort_err)
+    catalog_admitted = (isinstance(admission, dict) and admission.get("gate") == "catalog"
+                        and not admission.get("refusal"))
+    if catalog_admitted:
+        if admission.get("model"):
+            routed_model = admission["model"]
+        effort = admission.get("effort")
+        resolved_effort = effort.strip().lower() if isinstance(effort, str) and effort.strip() else None
+    else:
+        resolved_effort, effort_err = effort_for_provider(provider, effort)
+        if effort_err:
+            return _stamp_fence(effort_err)
     overrides, profile_err = (resolve_codex_home(account_profile, account_home)
                               if provider == "codex" and account_home
                               else resolve_account_home(provider, account_profile, account_home)
@@ -1589,12 +1666,16 @@ async def _run_agent_once(task, model, workdir, read_only=False,
             # The flags are orthogonal (codex-cli 0.147.0 `exec --help`:
             # --json prints events to stdout, -o writes the last message to a
             # file) and the job lane has run this exact combination since #22.
-            codex_effort = resolved_effort or DEFAULT_CODEX_REASONING_EFFORT
+            if catalog_admitted:
+                codex_effort = resolved_effort
+            else:
+                codex_effort = resolved_effort or DEFAULT_CODEX_REASONING_EFFORT
             argv += ["--skip-git-repo-check", "--json"]
             if not job_lane:
                 argv += ["--ephemeral"]
-            argv += ["-c", "model_reasoning_effort=%s" % codex_effort,
-                     "-m", m, "-o", tmp_out]
+            if codex_effort:
+                argv += ["-c", "model_reasoning_effort=%s" % codex_effort]
+            argv += ["-m", m, "-o", tmp_out]
             # Staged copies only — never source paths (jobs.start stages first).
             for img in images:
                 argv += ["-i", img]
@@ -1795,11 +1876,14 @@ async def _run_agent_once(task, model, workdir, read_only=False,
                                   "CLI (curl https://cursor.com/install), "
                                   "then `cursor-agent login`. Do not use the "
                                   "`agent` name (Grok collision)."})
-            slug, cursor_err = cursor_mod.resolve_model(
-                routed_model, resolved_effort, account_profile)
-            if cursor_err:
-                return _stamp_fence(cursor_err)
-            m = slug
+            if catalog_admitted:
+                m = str(routed_model or "").strip()
+            else:
+                slug, cursor_err = cursor_mod.resolve_model(
+                    routed_model, resolved_effort, account_profile)
+                if cursor_err:
+                    return _stamp_fence(cursor_err)
+                m = slug
             argv = [cursor_bin, "-p", "--trust", "--sandbox", "enabled",
                     "--workspace", workdir_abs, "--model", m]
             if read_only:
@@ -2025,6 +2109,11 @@ async def _run_agent_once(task, model, workdir, read_only=False,
 
         out = (res.get("stdout") or "").strip()
         err = (res.get("stderr") or "").strip()
+        if provider == "claude":
+            # A sign-in expiry notice is advice: it must neither type the run
+            # as auth_error nor stand in as the failure's detail.
+            err = strip_signin_expiry_warning(err)
+            res = dict(res, stderr=err)
         rc = res.get("returncode")
         if provider in ("claude", "grok"):
             process_error = (None if stalled_ok else
@@ -2231,7 +2320,29 @@ async def _run_agent_once(task, model, workdir, read_only=False,
             shutil.rmtree(tmp_api_settings, ignore_errors=True)
 
 
-async def run_agent(task, model, workdir, read_only=False,
+def _agent_settings(provider, profile, account_home, workdir):
+    """The four claude settings files, on every lane and account kind."""
+    if provider != "claude":
+        return ()
+    from providers.admission import claude_settings_files
+    from providers.claude import claude_config_home
+    return claude_settings_files(
+        claude_config_home(profile, account_home), workdir)
+
+
+def _admit_agent(provider, profile, model, effort, *, isolated, account_home,
+                 workdir):
+    from providers import admission
+    routed = resolve_route(model)["model"]
+    return admission.consider(
+        provider, profile, routed, effort,
+        isolated=bool(isolated), host_env=os.environ,
+        settings_files=_agent_settings(
+            provider, profile, account_home, workdir),
+        apply_aliases=True)
+
+
+async def _run_agent(task, model, workdir, read_only=False,
                     timeout_s=AGENT_TIMEOUT_S, account_profile="default",
                     allow_main=False, task_file=None, log_path=None,
                     err_log_path=None, job_lane=None, on_spawn=None,
@@ -2255,8 +2366,25 @@ async def run_agent(task, model, workdir, read_only=False,
     denied = refuse_payload(task)
     if denied:
         return _stamp_fence(denied)
-    bare, _eff, split_err = take_effort(model, effort)
-    provider = resolve_route(bare)["provider"] if not split_err else None
+    # Admission runs before the egress check inside _run_agent_once. A peel
+    # error is still today's error and is not an admission result.
+    from providers import admission
+    bare, peeled, split_err = take_effort(model, effort)
+    if split_err:
+        return _stamp_fence(split_err)
+    provider = resolve_route(bare)["provider"]
+
+    def admit(profile, isolated, home):
+        return _admit_agent(
+            provider, profile, bare, peeled, isolated=isolated, account_home=home,
+            workdir=workdir)
+
+    def finish(result, decision, profile):
+        if admission.is_terminal(decision):
+            return admission.refusal_envelope(provider, profile, decision)
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort(provider, decision, peeled))
+
     if provider in ("claude", "grok"):
         selection = provider_accounts.AccountSelection(
             account_profile, bare, timeout_s, candidates=account_candidates,
@@ -2267,10 +2395,18 @@ async def run_agent(task, model, workdir, read_only=False,
         if account_auth_isolated is None:
             account_auth_isolated = selection.managed or provider_accounts.ring_pinned(
                 provider, account_profile, resume_session)
+        isolated = bool(selection.managed or account_auth_isolated)
+        holder = admission.install_ring_skip(
+            selection, lambda account: admit(
+                account.get("account_profile"), isolated, account.get("account_home")))
         if account_deadline is not None:
             selection.deadline = min(selection.deadline, float(account_deadline))
         async def provider_attempt(account, remaining, managed):
-            return await _run_agent_once(**dict(kwargs,
+            decision = account.get("_admission")
+            if admission.is_terminal(decision):
+                return admission.refusal_envelope(
+                    provider, account.get("account_profile"), decision)
+            result = await _run_agent_once(**dict(kwargs,
                 account_profile=account["account_profile"], timeout_s=remaining,
                 account_home=account["account_home"] if managed or account_home else None,
                 account_home_explicit=(account.get("account_home_explicit", True)
@@ -2278,10 +2414,21 @@ async def run_agent(task, model, workdir, read_only=False,
                     True if account_home_explicit is None else account_home_explicit),
                 account_auth_isolated=managed or bool(account_auth_isolated),
                 account_deadline=selection.deadline,
-                pre_spawn=(lambda: selection.late_api_refusal(account)) if managed else None))
-        return await provider_accounts.run_selected(selection, provider_attempt, on_account_selected)
-    if split_err or provider != "codex":
-        return await _run_agent_once(**kwargs)
+                pre_spawn=(lambda: selection.late_api_refusal(account)) if managed else None,
+                admission=decision))
+            return admission.stamp(
+                result, decision,
+                sent_effort=admission.sent_effort(provider, decision, peeled))
+        result = await provider_accounts.run_selected(
+            selection, provider_attempt, on_account_selected)
+        replaced = admission.ring_exhausted(provider, result, holder)
+        return replaced if replaced is not None else result
+    if provider != "codex":
+        decision = admit(account_profile, False, account_home)
+        if admission.is_terminal(decision):
+            return admission.refusal_envelope(provider, account_profile, decision)
+        result = await _run_agent_once(**dict(kwargs, admission=decision))
+        return finish(result, decision, account_profile)
     selection = codex_accounts.AccountSelection(
         account_profile, bare, timeout_s, candidates=codex_candidates,
         pinned_home=codex_home, resume=bool(resume_session), homes=codex_homes,
@@ -2298,14 +2445,37 @@ async def run_agent(task, model, workdir, read_only=False,
     if codex_deadline is not None:
         selection.deadline = min(selection.deadline, float(codex_deadline))
     if not selection.managed and not codex_home:
-        result = await _run_agent_once(**kwargs)
+        decision = admit(account_profile, bool(kwargs["codex_auth_isolated"]), None)
+        if admission.is_terminal(decision):
+            return admission.refusal_envelope("codex", account_profile, decision)
+        result = await _run_agent_once(**dict(kwargs, admission=decision))
         if not result.get("ok"):
             result.setdefault("account_retry_safe", False)
             selection.failed({"account_profile": account_profile or "default"}, result)
-        return result
+        return finish(result, decision, account_profile)
+    # Isolation matches the spawn. A pinned home with the caller's API keys
+    # is not stripped, so today's gate can see the auth-env difference.
+    isolated = bool(kwargs["codex_auth_isolated"])
+    holder = admission.install_ring_skip(
+        selection, lambda account: admit(
+            account.get("account_profile"), isolated, account.get("codex_home")))
     async def attempt(account, remaining, managed):
+        decision = account.get("_admission")
+        if admission.is_terminal(decision):
+            return admission.refusal_envelope(
+                "codex", account.get("account_profile"), decision)
         call = dict(kwargs, account_profile=account["account_profile"],
                     timeout_s=remaining, account_home=account["codex_home"],
-                    account_deadline=selection.deadline)
-        return await _run_agent_once(**call)
-    return await codex_accounts.run_selected(selection, attempt, on_account_selected)
+                    account_deadline=selection.deadline, admission=decision)
+        result = await _run_agent_once(**call)
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort("codex", decision, peeled))
+    result = await codex_accounts.run_selected(selection, attempt, on_account_selected)
+    replaced = admission.ring_exhausted("codex", result, holder)
+    return replaced if replaced is not None else result
+
+
+async def run_agent(*args, **kwargs):
+    """Agent entry. Every result envelope carries the disclosure keys."""
+    from providers import admission
+    return admission.ensure_disclosure(await _run_agent(*args, **kwargs))

@@ -1,10 +1,10 @@
 # Model catalog maintenance
 
-The catalog records model identifiers, display names, advertised effort values,
-source, observation time, CLI version, and whether availability is provider
-advertised or unknown. A provider listing is not an inference test or proof of
-account entitlement. The bundled snapshot contains sanitized metadata only; it
-never contains profile names, home paths, endpoints, credentials, or diagnostics.
+A v2 catalog record stores model identifiers, display names, advertised effort
+values, source (`live`), observation time, CLI version, and whether availability
+is provider advertised or unknown. A provider listing is not an inference test
+or proof of account entitlement. Records do not contain profile names, home
+paths, endpoints, credentials, or diagnostics.
 
 The legacy `omni models [--timeout N]` and MCP `list_models` remain available.
 That view still runs the fenced `agy models` command and adds `routable_models`
@@ -18,83 +18,57 @@ omni models status --provider cursor --details --json
 omni models status --provider cursor --profile work --json
 omni models refresh --provider all --profile default --timeout 120 --json
 omni models check --provider cursor --profile default --json
-omni models import --provider claude --profile default --file ./claude-catalog.json
-omni models snapshot --output /tmp/model-catalogs.json --profile default
 omni models schedule --print --provider codex --profile work --interval 86400
 ```
 
-`status` and `check` read local data only. Status reports the source, observation
-time, age, stale state (48 hours by default), last refresh result, and drift from
-the bundled snapshot. Add `--details` to status to include the normalized model
-rows and exact IDs. `source` identifies who produced the record (`live` or
-`manual`); `origin` identifies where this copy came from (`local` or `bundled`).
-If no valid local cache can be read, status can show bundled rows with
-`origin=bundled` and a `cache_diagnostic`; that is not a fresh live query. Check
-exits 0 when there is no drift, 3 when it finds drift,
-and 2 when a usable last-good catalog is missing or invalid.
+`status` and `check` read the v2 record only. Status reports, per provider,
+`observed_at`, age, stale state (48 hours by default), and the model count.
+Add `--details` to list each model's id and name. A missing record has null
+freshness and a model count of zero. Check admits the shipped defaults against
+that record. It exits 0 when every default is admitted (`effort_required` is
+reported and is not a failure) and 2 when any default is refused.
 
-Refresh starts each provider independently. Each automatic discovery child must
-receive verified `seatbelt-fs` metadata from the shared host fence and uses an
-empty temporary working directory. On platforms without that verified fence,
-automatic discovery fails closed with `discovery_unavailable`; use manual import
-to add catalog data there. Cursor, agy, Codex, Claude, and Grok use metadata-only
-listing operations; no model prompt or inference request is sent. Automatic
-adapter availability describes whether a listing method exists, not whether an
-account is entitled to use every model.
-Grok's authenticated registry listing remains `availability=unknown`; an
-unauthenticated banner is an `auth_error` and leaves last-good data unchanged.
-Output and deadlines are capped. A fence refusal,
-authentication failure, malformed or incomplete output, pagination loop, timeout,
-or output cap leaves that provider's last-good file unchanged. Refresh records an
-installed CLI version when the bounded fenced version query succeeds; otherwise
-the valid model listing is kept with an unknown version. Refresh exits 2
-when any selected provider fails while retaining successful providers.
+Refresh starts each provider independently and writes only the v2 record.
+Success and the process exit follow that write. On macOS, each automatic
+discovery child must receive verified `seatbelt-fs` metadata from the shared
+host fence and uses an empty temporary working directory. Off macOS, discovery
+uses the `metadata-unfenced` posture in the next section. Cursor, agy, Codex,
+Claude, and Grok use metadata-only listing operations; no model prompt or
+inference request is sent. A listing is not proof that an account may use
+every model. Grok's registry listing remains `availability=unknown`. An
+unauthenticated grok listing is `catalog_unreadable` and does not replace the
+v2 record. Output and deadlines are capped. A fence refusal, malformed or
+incomplete output, pagination loop, timeout, or output cap does not replace
+that provider's v2 record. Refresh records an installed CLI version when the
+bounded fenced version query succeeds; otherwise the valid model listing is
+kept with an unknown version. Refresh exits 2 when any selected provider
+fails, and it still writes the providers that succeeded.
 
-Caches live under `$OMNI_LLM_STATE_DIR/model-catalogs` (default
-`~/.local/state/omni-llm/model-catalogs`). Cache identity includes the selected
+v2 records live under `$OMNI_LLM_STATE_DIR/model-catalogs-v2` (default
+`~/.local/state/omni-llm/model-catalogs-v2`). The identity key stays under
+`$OMNI_LLM_STATE_DIR/model-catalogs`. Cache identity includes the selected
 profile, the canonical home selected by the provider's effective child
 environment, and every supported endpoint binding that survives the child's
 account scrubbing and environment allowlist. `OMNI_LLM_CATALOG_ENDPOINT_*` is a
 separate metadata-only cache tag; it does not configure a provider child. The
-identity is stored as a locally salted keyed fingerprint; the cache and exported
-snapshot do not contain the home or endpoint values. Profile-specific caches do
-not cross over when the effective child home or endpoint changes.
+identity is stored as a locally salted keyed fingerprint; the record does not
+contain the home or endpoint values. Profile-specific records do not cross
+over when the effective child home or endpoint changes. A name of the form
+`agy-opus-<version>@<effort>` is refused as `unsupported_model`. Pass the
+catalog id as `agy/<id>`.
 
-Manual import accepts a normalized JSON object. Import sets `source` to `manual`
-and `availability` to `unknown`; it keeps a supplied observation timestamp but
-does not invent one. A minimal example is:
+## Discovery posture off macOS
 
-```json
-{
-  "provider": "grok",
-  "models": [
-    {"id": "grok-example", "name": "Grok example", "supported_efforts": []}
-  ]
-}
-```
-
-The provider-specific `routable_id` is generated when it is omitted. Catalog
-entries are validated and atomically replaced only after the complete import is
-valid. Manual import works for disconnected providers and providers without a
-currently usable automatic adapter.
-
-## Snapshot promotion and rollback
-
-Snapshot requires an explicit output file and exports validated records while
-preserving each provider's original source kind, observation time, and CLI
-version. It preserves unselected providers already in the destination. Review the
-result before promoting it to `providers/model_catalog.json` on a work branch:
-
-```sh
-omni models snapshot --provider cursor --profile default \
-  --output providers/model_catalog.json
-git diff -- providers/model_catalog.json
-```
-
-Run the affected tests and review the source evidence before committing a
-promotion. To roll back a committed snapshot, revert that promotion commit. For
-an uncommitted manual export, keep the prior file copy and replace the export only
-after verifying the backup. Refresh never edits repository files.
+On macOS, catalog discovery still requires verified `seatbelt-fs` metadata.
+Off macOS, discovery runs `metadata-unfenced`: no filesystem containment, the
+same posture inference already uses on those hosts. There is no new sandbox.
+The child argv is a fixed per-provider metadata command, the environment is
+the catalog child environment used today, the working directory is an empty
+temporary directory, and the run stays inside the refresh timeout. A discovery
+record stores `discovery.posture` (`seatbelt-fs` or `metadata-unfenced`) and
+`discovery.platform`. Scheduled refresh starts those metadata CLIs on
+non-macOS hosts. Dispatch-time checks, including agy effort capability, still
+require `seatbelt-fs` on every platform.
 
 ## Optional scheduling
 
@@ -131,10 +105,9 @@ interactive Keychain session as a terminal, so a job can report a named
 authentication failure; inspect `omni models status --profile <name>` after each
 run.
 
-The cron and systemd examples below are for hosts where the shared host fence
-can verify `seatbelt-fs`. On hosts without that fence, including the current
-non-Darwin implementation, scheduled refresh fails closed with
-`discovery_unavailable`; use `omni models import` for manual catalog data instead.
+The cron and systemd examples below run the same metadata CLIs. On macOS the
+shared host fence must verify `seatbelt-fs`. Off macOS the job runs
+`metadata-unfenced` (no filesystem containment), as described above.
 
 The equivalent cron command on a supported host is:
 
@@ -144,8 +117,7 @@ The equivalent cron command on a supported host is:
 
 For systemd on a supported host, use the same command in a user service and add
 a timer with the desired interval. Refresh only updates local cache state: it
-never installs CLIs or schedules, runs inference, changes defaults or aliases,
-or promotes a source snapshot.
+never installs CLIs or schedules, runs inference, or changes defaults.
 
 ```ini
 # ~/.config/systemd/user/omni-model-catalog.service
@@ -162,3 +134,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+## Activating a release
+
+Install the candidate in a separate directory, and keep the old release for
+running processes. Run `models refresh` once for each configured ring profile,
+in the MCP client launch environment. Run `models check` for each of those
+profiles. Switch to the candidate only if every command exits zero.

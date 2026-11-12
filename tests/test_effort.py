@@ -3,8 +3,9 @@
 """Hermetic tests for the public `effort` argument.
 
 Pins:
-- omitted effort is a no-op on grok/claude argv (codex still defaults to high)
-- specified effort is passed as the backend's own flag
+- an admitted omitted effort is medium when that token is listed (grok's ruled set lists it)
+- claude with no effort evidence still sends no flag; codex no longer injects high
+- specified effort is passed as the backend's own flag when the record lists it
 - unknown tokens and backends without an effort flag are LOUD unsupported_effort
 - MCP / CLI / agent surfaces all accept the same name
 """
@@ -32,6 +33,7 @@ from providers import grok as grok_mod
 from providers import jobs
 from providers import pi as pi_mod
 from providers import openai_compat as openai_mod
+from tests import offline_home
 from tests.test_cli import run_cli
 from tests.test_agent import (
     FakeRunCli,
@@ -41,6 +43,50 @@ from tests.test_agent import (
     run_cli_main,
     LaneTestCase,
 )
+
+# Seeds v2 records; tests/offline_home.py gives this module the real gate.
+OMNI_TEST_REAL_ADMISSION = True
+
+
+_HOME = None
+_WIDE = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _save_model(provider, model, efforts=None, profile="default"):
+    """Write one v2 row so an admitted attempt can reach the patched spawn."""
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    item = {
+        "id": model,
+        "name": model,
+        "routable_id": "%s/%s" % (provider, model),
+    }
+    if efforts is not None:
+        item["supported_efforts"] = list(efforts)
+    record, _warnings = validate_strict(provider, {
+        "provider": provider,
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": [item],
+    })
+    catalog_v2.save(provider, profile, record)
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
 
 
 class TestEffortHelpers(unittest.TestCase):
@@ -228,7 +274,14 @@ class TestEffortHelpers(unittest.TestCase):
 
 
 class TestConsultArgv(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_grok_omitted_effort_has_no_flag(self):
+        # The ruled vocabulary lists medium, so an omitted effort is disclosed
+        # as omni's default and sent.
+        _save_model("grok", "grok-4.5")
         fake = FakeRunCli(stdout=json.dumps({"text": "OK", "usage": {}}))
         with mock.patch.object(grok_mod, "run_cli", fake), \
                 mock.patch.object(shutil, "which", _fake_which), \
@@ -237,10 +290,13 @@ class TestConsultArgv(unittest.TestCase):
                 depth(None):
             res = asyncio.run(grok_mod.run_grok_subprocess("hi", "grok-4.5", 30))
         self.assertTrue(res.get("ok"), res)
-        self.assertNotIn("--reasoning-effort", fake.argv)
-        self.assertNotIn("--effort", fake.argv)
+        self.assertEqual(res.get("effort"), "medium")
+        self.assertEqual(res.get("effort_source"), "omni_default")
+        i = fake.argv.index("--reasoning-effort")
+        self.assertEqual(fake.argv[i + 1], "medium")
 
     def test_grok_passes_reasoning_effort(self):
+        _save_model("grok", "grok-4.5")
         fake = FakeRunCli(stdout=json.dumps({"text": "OK", "usage": {}}))
         with mock.patch.object(grok_mod, "run_cli", fake), \
                 mock.patch.object(shutil, "which", _fake_which), \
@@ -254,6 +310,7 @@ class TestConsultArgv(unittest.TestCase):
         self.assertEqual(fake.argv[i + 1], "xhigh")
 
     def test_claude_omitted_effort_has_no_flag(self):
+        _save_model("claude", "opus")
         fake = FakeRunCli(stdout=json.dumps({"result": "OK", "usage": {}}))
         with mock.patch.object(claude_mod, "run_cli", fake), \
                 mock.patch.object(shutil, "which", _fake_which), \
@@ -263,6 +320,7 @@ class TestConsultArgv(unittest.TestCase):
         self.assertNotIn("--effort", fake.argv)
 
     def test_claude_passes_effort_flag(self):
+        _save_model("claude", "opus", _WIDE)
         fake = FakeRunCli(stdout=json.dumps({"result": "OK", "usage": {}}))
         with mock.patch.object(claude_mod, "run_cli", fake), \
                 mock.patch.object(shutil, "which", _fake_which), \
@@ -302,6 +360,7 @@ class TestConsultArgv(unittest.TestCase):
         self.assertEqual(fake.argv[i + 1], "xhigh")
 
     def test_codex_effort_kwarg_overrides_default(self):
+        _save_model("codex", "gpt-5.6-sol", _WIDE)
         captured = {}
 
         async def fake_run_cli(argv, **kwargs):
@@ -371,18 +430,17 @@ class TestDispatchEffort(unittest.TestCase):
         self.assertEqual(seen["kwargs"].get("effort"), "high")
 
     def test_grok_max_is_rejected_before_provider(self):
-        rec = []
-
-        async def fake_grok(*a, **k):
-            rec.append(1)
-            return {"ok": True, "text": "x", "model": "grok-4.5"}
-
-        with mock.patch.object(grok_mod, "run_grok_subprocess", fake_grok), \
+        # max is outside the ruled grok vocabulary. Admission refuses inside
+        # the provider, before the CLI is spawned.
+        _save_model("grok", "grok-4.5")
+        fake = FakeRunCli()
+        with mock.patch.object(grok_mod, "run_cli", fake), \
+                mock.patch.object(shutil, "which", _fake_which), \
                 depth(None):
             res = asyncio.run(dispatch.route_to_provider(
                 "hi", "grok-4.5", 30, [], "default", effort="max"))
         self.assertEqual(res.get("reason"), "unsupported_effort")
-        self.assertEqual(rec, [])
+        self.assertEqual(fake.calls, [])
 
     def test_openai_effort_is_rejected_before_provider(self):
         rec = []
@@ -433,17 +491,17 @@ class TestDispatchEffort(unittest.TestCase):
         self.assertEqual(params["effort"].default, None)
 
     def test_cursor_classification_uses_each_seats_catalog_profile(self):
+        # The slug pre-check is gone. The seat's own profile record admits it.
         seat = {"provider": "cursor", "model": "cursor/profile-family",
                 "account_profile": "work", "effort": "high"}
-        with mock.patch.object(dispatch, "cursor_effort_slug",
-                               return_value=("profile-family-high", None)) as lookup, \
-                mock.patch.object(dispatch, "resolve_profile", return_value=({}, None)), \
+        home = tempfile.mkdtemp(prefix="omni-effort-cursor-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with mock.patch.dict(os.environ, {"OMNI_LLM_CURSOR_CONFIG_DIR_WORK": home}), \
                 mock.patch.object(dispatch, "_health_passive_probe"), \
                 mock.patch.object(dispatch, "_health_kind", return_value="healthy"):
+            _save_model("cursor", "profile-family-high", profile="work")
             result = dispatch._classify_seat(seat, False, None)
         self.assertEqual(result, ("healthy", None))
-        self.assertEqual(lookup.call_args.args,
-                         ("profile-family", "high", "work"))
 
 
 class TestAgyEffortCli(unittest.TestCase):
@@ -499,14 +557,15 @@ class TestAgyEffortCli(unittest.TestCase):
             calls.append((args, kwargs))
             return {"ok": True, "text": "ok"}
 
+        _save_model("agy", "m")
         with mock.patch.object(agy_mod, "HAS_SDK", True), \
                 mock.patch.object(agy_mod.platform, "system", return_value="Linux"), \
                 mock.patch.object(agy_mod, "run_agy_sdk", fake_sdk), \
                 mock.patch.object(agy_mod, "run_agy_subprocess", fake_subprocess):
             result = asyncio.run(agy_mod.run_agy("hi", "m", 30, effort="high"))
-        self.assertTrue(result["ok"])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1]["effort"], "high")
+        # An id plus an effort is refused before either branch.
+        self.assertEqual(result.get("reason"), "effort_already_encoded")
+        self.assertEqual(calls, [])
 
 
 class TestCliEffort(unittest.TestCase):
@@ -528,16 +587,24 @@ class TestCliEffort(unittest.TestCase):
 
 
 class TestAgentEffort(LaneTestCase):
-    def test_codex_agent_uses_default_high(self):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
+    def test_codex_agent_omitted_effort_sends_medium(self):
+        _save_model("codex", "gpt-5.6-sol", _WIDE)
         fake = FakeRunCli()
         with depth(None), patched_lane(fake):
             env = asyncio.run(agent_lane.run_agent(
                 task="t", model="codex/gpt-5.6-sol",
                 workdir=self.mkdir(), timeout_s=30))
         self.assertTrue(env.get("ok"), env)
-        self.assertIn("model_reasoning_effort=high", fake.argv)
+        self.assertEqual(env.get("effort"), "medium")
+        self.assertEqual(env.get("effort_source"), "omni_default")
+        self.assertIn("model_reasoning_effort=medium", fake.argv)
 
     def test_codex_agent_passes_effort(self):
+        _save_model("codex", "gpt-5.6-sol", _WIDE)
         fake = FakeRunCli()
         with depth(None), patched_lane(fake):
             env = asyncio.run(agent_lane.run_agent(
@@ -547,6 +614,7 @@ class TestAgentEffort(LaneTestCase):
         self.assertIn("model_reasoning_effort=xhigh", fake.argv)
 
     def test_claude_agent_omitted_has_no_flag(self):
+        _save_model("claude", "sonnet")
         fake = FakeRunCli()
         with depth(None), patched_lane(fake):
             env = asyncio.run(agent_lane.run_agent(
@@ -556,6 +624,7 @@ class TestAgentEffort(LaneTestCase):
         self.assertNotIn("--effort", fake.argv)
 
     def test_claude_agent_passes_effort(self):
+        _save_model("claude", "sonnet", _WIDE)
         fake = FakeRunCli()
         with depth(None), patched_lane(fake):
             env = asyncio.run(agent_lane.run_agent(
@@ -566,6 +635,7 @@ class TestAgentEffort(LaneTestCase):
         self.assertEqual(fake.argv[i + 1], "max")
 
     def test_grok_agent_passes_reasoning_effort(self):
+        _save_model("grok", "grok-4.5")
         fake = FakeRunCli()
         with depth(None), patched_lane(fake):
             env = asyncio.run(agent_lane.run_agent(
@@ -885,6 +955,7 @@ class TestAtEffortShorthand(unittest.TestCase):
             rec.append("grok")
             return {"ok": True, "text": "x", "model": model}
 
+        _save_model("grok", "grok-4.6")
         with mock.patch.object(codex_mod, "run_codex_subprocess", fake_codex), \
                 mock.patch.object(grok_mod, "run_grok_subprocess", fake_grok), \
                 depth(None):
@@ -915,6 +986,8 @@ class TestAtEffortShorthand(unittest.TestCase):
                 mock.patch.object(codex_mod, "run_codex_subprocess", fake_codex), \
                 mock.patch.object(grok_mod, "run_grok_subprocess", fake_grok), \
                 depth(None):
+            _save_model("codex", "x", _WIDE)
+            _save_model("grok", "grok-4.6")
             health.flag("codex/x", "default", source="test")
             res = asyncio.run(dispatch.dispatch_llm_request(
                 "hi", "codex/x@high,grok-4.6", 30, [], "default"))
@@ -930,6 +1003,8 @@ class TestAtEffortShorthand(unittest.TestCase):
             "OMNI_LLM_STATE_DIR": state, "OMNI_LLM_QUOTA_PROBE": "0"})
         env_patch.start()
         self.addCleanup(env_patch.stop)
+        _save_model("codex", "x", _WIDE)
+        _save_model("grok", "grok-4.6")
 
         async def fake_codex(prompt, model, *a, **k):
             seen["codex"] = k.get("effort")

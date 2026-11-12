@@ -500,33 +500,39 @@ def _restore_env(var, old):
         os.environ[var] = old
 
 
+def _live_probe(road):
+    """(runner, shipped default, extra kwargs) for one live probe, or None."""
+    if road == "claude":
+        from providers.claude import run_claude_subprocess
+        from providers.config import DEFAULT_CLAUDE_MODEL
+        return run_claude_subprocess, DEFAULT_CLAUDE_MODEL, {"account_pinned": True}
+    if road == "codex":
+        from providers.codex import run_codex_subprocess
+        from providers.config import DEFAULT_CODEX_MODEL
+        return run_codex_subprocess, DEFAULT_CODEX_MODEL, {"account_pinned": True}
+    if road == "grok":
+        from providers.grok import run_grok_subprocess
+        from providers.config import DEFAULT_GROK_MODEL
+        return run_grok_subprocess, DEFAULT_GROK_MODEL, {"account_pinned": True}
+    if road == "cursor":
+        from providers.cursor import run_cursor_subprocess
+        from providers.config import DEFAULT_CURSOR_MODEL
+        return run_cursor_subprocess, DEFAULT_CURSOR_MODEL, {}
+    return None
+
+
 def _live_one(road, name):
     async def _go():
-        if road == "claude":
-            from providers.claude import run_claude_subprocess
-            from providers.config import DEFAULT_CLAUDE_MODEL
-            return await run_claude_subprocess(
-                LIVE_PROMPT, DEFAULT_CLAUDE_MODEL, LIVE_TIMEOUT_S,
-                account_profile=name, account_pinned=True)
-        if road == "codex":
-            from providers.codex import run_codex_subprocess
-            from providers.config import DEFAULT_CODEX_MODEL
-            return await run_codex_subprocess(
-                LIVE_PROMPT, DEFAULT_CODEX_MODEL, LIVE_TIMEOUT_S,
-                account_profile=name, account_pinned=True)
-        if road == "grok":
-            from providers.grok import run_grok_subprocess
-            from providers.config import DEFAULT_GROK_MODEL
-            return await run_grok_subprocess(
-                LIVE_PROMPT, DEFAULT_GROK_MODEL, LIVE_TIMEOUT_S, account_profile=name, account_pinned=True)
-        if road == "cursor":
-            from providers.cursor import run_cursor_subprocess
-            from providers.config import DEFAULT_CURSOR_MODEL
-            return await run_cursor_subprocess(
-                LIVE_PROMPT, DEFAULT_CURSOR_MODEL, LIVE_TIMEOUT_S,
-                account_profile=name)
-        return {"ok": False, "reason": "unsupported_profile",
-                "detail": "no live check for road %s" % road}
+        probe = _live_probe(road)
+        if probe is None:
+            return {"ok": False, "reason": "unsupported_profile",
+                    "detail": "no live check for road %s" % road}
+        run, model, extra = probe
+        # The runner admits the probe against this profile's record itself,
+        # with the same gate inputs as a real request; a catalog refusal
+        # comes back before any spawn.
+        return await run(
+            LIVE_PROMPT, model, LIVE_TIMEOUT_S, account_profile=name, **extra)
     return asyncio.run(_go())
 
 
@@ -571,6 +577,10 @@ def _quota_one(row, strict_quota=False):
 
 
 def _live_result_state(road, identity, res):
+    from providers.admission import TERMINAL_CATALOG_REFUSALS
+    if res.get("reason") in TERMINAL_CATALOG_REFUSALS:
+        # Not a failed probe: the runner refused before calling the vendor.
+        return "not_admitted", [res.get("reason")]
     if res.get("ok"):
         return "session_ok", []
     detail = res.get("detail") or ""

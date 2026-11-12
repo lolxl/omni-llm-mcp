@@ -27,6 +27,11 @@ claude-fable-5-1-thinking-max
 claude-fable-5-1-thinking-medium
 claude-fable-5-1-thinking-xhigh
 claude-fable-5-1-xhigh
+claude-fable-5-2-high
+claude-fable-5-2-low
+claude-fable-5-2-max
+claude-fable-5-2-medium
+claude-fable-5-2-xhigh
 claude-fable-5-high
 claude-fable-5-low
 claude-fable-5-max

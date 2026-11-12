@@ -540,10 +540,24 @@ async def run_grok_subprocess(prompt, model, timeout_s, account_profile="default
         return selection.exhausted()
     isolated = selection.managed or provider_accounts.ring_pinned(
         "grok", account_profile, account_pinned)
+    # A blank model is the runtime default. Admit that id, which is what argv sends.
+    requested = str(model or "").strip() or DEFAULT_GROK_MODEL
+    from providers import admission
+    holder = admission.install_ring_skip(selection, lambda account: admission.consider(
+        "grok", account.get("account_profile"), requested, effort, isolated=isolated,
+        host_env=os.environ, settings_files=()))
+
     async def attempt(account, remaining, managed):
-        return await _run_grok_once(
-            prompt, model, remaining, account["account_profile"], files=files, effort=effort,
-            scrub_siblings=scrub_siblings or isolated,
+        decision = account.get("_admission")
+        run_model, run_effort, _catalog = admission.bound_call(requested, effort, decision)
+        result = await _run_grok_once(
+            prompt, run_model, remaining, account["account_profile"], files=files,
+            effort=run_effort, scrub_siblings=scrub_siblings or isolated,
             account_home=account["account_home"] if managed or isolated else None,
             account_auth_isolated=isolated, account_deadline=selection.deadline)
-    return await provider_accounts.run_selected(selection, attempt)
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort("grok", decision, effort))
+
+    result = await provider_accounts.run_selected(selection, attempt)
+    replaced = admission.ring_exhausted("grok", result, holder)
+    return replaced if replaced is not None else result

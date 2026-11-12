@@ -237,6 +237,54 @@ def safe_detail(text, limit=300):
     return mask_text(text if isinstance(text, str) else str(text))[:limit]
 
 
+# The claude CLI's notice that a still-valid sign-in will end soon. It names
+# "claude auth login", so the generic auth markers match it, yet it reports
+# nothing about the call that carried it.
+#
+# The match is the EXACT notice template and nothing looser:
+#
+#   Warning: this sign-in ends between <DATE> and <DATE> (in <N> day[s] at the
+#   earliest). Renewing it does not move those dates. Run claude auth login
+#   before then, or use claude setup-token for unattended jobs.
+#
+# Only <DATE> (YYYY-MM-DD) and <N> (digits) vary. The words come in that order,
+# joined only by whitespace (one line break allowed, for wrapping) and ANSI
+# colour codes; no extra word or line may sit between them. The match starts a
+# line. Anything else, a reworded notice or a real error line that quotes part
+# of it, is left alone and still reads as the auth failure it may be.
+_ANSI = r"(?:\x1b\[[0-9;]*m)*"
+_NL = r"(?:\r\n|\n|\r)"
+_SIGNIN_SEP = (_ANSI + r"(?:[ \t]+(?:" + _NL + r"[ \t]*)?|" + _NL + r"[ \t]*)"
+               + _ANSI)
+_SIGNIN_DATE = r"\d{4}-\d{2}-\d{2}"
+_SIGNIN_NOTICE_TOKENS = (
+    r"this", r"sign-in", r"ends", r"between", _SIGNIN_DATE, r"and", _SIGNIN_DATE,
+    r"\(in", r"\d+", r"days?", r"at", r"the", r"earliest\)\.",
+    r"Renewing", r"it", r"does", r"not", r"move", r"those", r"dates\.",
+    r"Run", r"claude", r"auth", r"login", r"before", r"then,", r"or", r"use",
+    r"claude", r"setup-token", r"for", r"unattended", r"jobs\.")
+_SIGNIN_EXPIRY_NOTICE = re.compile(
+    r"^" + _ANSI + _ANSI.join(tuple("Warning:"))
+    + _SIGNIN_SEP + _SIGNIN_SEP.join(_SIGNIN_NOTICE_TOKENS)
+    + _ANSI + r"(?:\r\n|\n|\r|\Z)",
+    re.MULTILINE)
+
+
+def strip_signin_expiry_warning(text):
+    """Return *text* without the claude sign-in expiry notice.
+
+    The notice is advice, not a failure: classification and failure detail
+    must read what is left. Only the matched notice (with its own line end)
+    is removed; every other line, blank lines and CRLF included, is kept as
+    it was. Text without an exact notice comes back unchanged.
+    """
+    text = text if isinstance(text, str) else ("" if text is None else str(text))
+    if "sign-in" not in text:
+        return text
+    stripped = _SIGNIN_EXPIRY_NOTICE.sub("", text)
+    return stripped if stripped.strip() else ""
+
+
 # Fields of an envelope that carry failure prose (never the model's answer).
 FAILURE_TEXT_FIELDS = frozenset((
     "detail", "error", "message", "metrics_error", "last_error", "warning"))

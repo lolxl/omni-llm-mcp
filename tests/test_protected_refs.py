@@ -33,6 +33,7 @@ from unittest import mock
 
 from providers import agent_lane, host_fence, job_runner, jobs, kernel_sandbox
 from providers.agent_lane import ENV_DEPTH
+from tests import offline_home
 
 DARWIN = platform.system() == "Darwin"
 OVERRIDE_ENV = "OMNI_LLM_PROTECTED_BRANCHES"
@@ -53,6 +54,24 @@ def _write_exec(path, text):
 def _read(path):
     with open(path, encoding="utf-8") as handle:
         return handle.read()
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 class _Base(unittest.TestCase):
@@ -144,6 +163,11 @@ def _sh_quote(text):
 class RecordedProtectedList(_Base):
     """Issue repro 1: the default branch is read once, not from child-writable refs."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     @unittest.skipUnless(DARWIN, "needs the macOS host fence")
     def test_child_symbolic_ref_on_the_remote_default_does_not_move_protection(self):
         repo = self.repo(default="trunk")
@@ -218,6 +242,11 @@ class RecordedProtectedList(_Base):
 class RecordIdentity(_Base):
     """Issue: a record that does not fit is never rebuilt from refs."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _tamper(self, repo, mutate):
         self.assertIsNone(agent_lane._workdir_fence(repo, False))
         files = self.records()
@@ -282,6 +311,11 @@ class RecordIdentity(_Base):
 
 class PostRunVerification(_Base):
     """A run that changed a protected ref fails, whatever route it took."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     def _assert_changed(self, env, ref):
         self.assertFalse(env.get("ok"), env)
@@ -468,6 +502,11 @@ class PostRunVerification(_Base):
 class RecordIsOutsideTheChildsReach(_Base):
     """A fenced child cannot write the protected-branch record (live probe)."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _fenced(self, repo, script):
         argv, env, _meta = host_fence.prepare_host_fence(
             ["/bin/sh", "-c", script], provider="claude", workdir=repo,
@@ -559,6 +598,11 @@ class ResidualItems(_Base):
 class LedgerEnrollment(_Base):
     """A missing record is not "first sight": enrolled repositories are listed."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _enroll(self, repo):
         self.assertIsNone(agent_lane._workdir_fence(repo, False))
         self.assertEqual(len(self.records()), 1)
@@ -632,6 +676,11 @@ class LedgerEnrollment(_Base):
 class DecoyCommonDir(_Base):
     """A linked worktree cannot point the verification at a copy of the repo."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _linked(self, default="release/v1"):
         repo = self.repo(default=default, pack=True)
         linked = os.path.join(self.root, "lw")
@@ -692,6 +741,11 @@ class DecoyCommonDir(_Base):
 @unittest.skipUnless(DARWIN, "needs the macOS host fence")
 class RecordContainment(_Base):
     """The record is out of reach in EVERY fenced profile, ancestors included."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     def _fenced(self, workdir, script):
         argv, env, _meta = host_fence.prepare_host_fence(
@@ -959,6 +1013,11 @@ class MaskedRefusals(_Base):
 class DirectoryMoveHole(_Base):
     """The kernel profile closes the directory-move hole; the compare is not the control."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _plant_script(self, spelling="release"):
         return ("mkdir \"$R/plant\"; printf '%%s\\n' %s > \"$R/plant/v1\"; "
                 "mv \"$R/plant\" \"$R/.git/refs/heads/%s\"; echo mv=$? > \"$R/rc.txt\"; "
@@ -1021,6 +1080,11 @@ class DirectoryMoveHole(_Base):
 @unittest.skipUnless(DARWIN, "needs the macOS host fence")
 class FirmlinkSpelling(_Base):
     """A state dir spelled through /System/Volumes/Data is denied under its plain spelling too."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     def test_record_and_ancestors_are_denied_under_the_plain_spelling(self):
         plain = os.path.join(self.root, "plain")
@@ -1331,6 +1395,8 @@ class RepoRootRename(_Base):
     """
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         super().setUp()
         self.tag = os.path.basename(self.root)
 
@@ -1401,6 +1467,11 @@ class RepoRootRename(_Base):
 class RefsHeadsAlwaysDenied(_Base):
     """``refs`` and ``refs/heads`` of the common dir are denied even when missing."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _staged_move(self, repo):
         staged = _sh_quote(os.path.join(repo, "staged"))
         return ("mkdir %s; printf '%%s\\n' %s > %s; mv %s %s; echo mv=$? > %s" % (
@@ -1458,6 +1529,11 @@ class RefsHeadsAlwaysDenied(_Base):
 
 class SymbolicProtectedName(_Base):
     """A protected local name that is a symbolic ref is refused at admission."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     def _symbolic(self, repo, kind):
         if kind == "single":
@@ -1639,6 +1715,11 @@ class NoSymlinkUnderRefs(_Base):
 class SymrefUnderEverySpelling(_Base):
     """Any spelling of a protected name that is a symbolic ref refuses write mode."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     @staticmethod
     def _fake_git(listing):
         def run(*args):
@@ -1729,6 +1810,11 @@ class SymrefUnderEverySpelling(_Base):
 class StateDirHops(_Base):
     """Every hop of a symlinked state dir path (and its ancestors) is denied."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def _hops(self):
         wd = os.path.join(self.root, "wd")
         os.makedirs(os.path.join(wd, "real"))
@@ -1811,6 +1897,11 @@ class MaskedSymrefRefusal(_Base):
 
 class MetadataSymlinks(_Base):
     """A symlinked file the protect denies name is a filesystem alias: write mode refuses."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     def _link(self, repo, leaf):
         path = os.path.join(repo, ".git", leaf)

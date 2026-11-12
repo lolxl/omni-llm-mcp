@@ -11,6 +11,7 @@ is pinned to a loopback URL so a missed patch cannot hit api.x.ai.
 """
 import asyncio
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,9 +25,45 @@ if ROOT not in sys.path:
 from providers import grok_image_cli
 from providers import kernel_sandbox
 from providers import xai_image
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 TW_MOBILE = "0912345678"
+
+
+def _seed_grok_image():
+    """The direct runner admits grok-4.7 before it can reach subprocess.run."""
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    from providers.grok_image_cli import GROK_IMAGE_MODEL
+    record, _warnings = validate_strict("grok", {
+        "provider": "grok",
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": [{
+            "id": GROK_IMAGE_MODEL,
+            "name": GROK_IMAGE_MODEL,
+            "routable_id": "grok/%s" % GROK_IMAGE_MODEL,
+            "supported_efforts": ["medium"],
+        }],
+    })
+    catalog_v2.save("grok", "default", record)
 
 
 def _env(gate="1"):
@@ -52,6 +89,16 @@ class TestImageModuleDirectRefuse(unittest.TestCase):
       before subprocess.run
     - providers/xai_image.py run_xai_image → refuse_payload before urlopen
     """
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        self.state = tempfile.mkdtemp(prefix="omni_img_admit_")
+        self.addCleanup(shutil.rmtree, self.state, True)
+        env = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": self.state})
+        env.start()
+        self.addCleanup(env.stop)
+        _seed_grok_image()
 
     def test_grok_image_cli_direct_refuses_with_gate_on(self):
         sent = []
@@ -133,6 +180,9 @@ class TestImageModuleDirectRefuse(unittest.TestCase):
             kernel_sandbox.protected_home(), "omni_grok_image_probe_fixture",
         )
         with _env(gate=None):
+            # The cleared env sets XAI_API_BASE, which is part of the grok
+            # scope fingerprint. Seed after that env is in place.
+            _seed_grok_image()
             with mock.patch.object(kernel_sandbox, "_run_probe", fake_probe), \
                     mock.patch.object(
                         kernel_sandbox.tempfile, "mkstemp",

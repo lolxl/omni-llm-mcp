@@ -16,6 +16,7 @@ from unittest import mock
 
 from providers import host_fence as h
 from providers import kernel_sandbox, provider_accounts
+from tests import offline_home
 
 DARWIN_FENCE = kernel_sandbox.available()
 PASS_VAR = "OMNI_LLM_CHILD_ENV_PASS"
@@ -30,6 +31,24 @@ CONNECT_PROBE = (
     "except OSError as e:\n"
     "    print('FAIL', e.errno)\n"
 )
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Issue #223: every fenced spawn below admits ~/.claude.json and the login
+    # keychain by name. Point the fence at a synthetic home so a CLI session
+    # rewriting them between admission and profile build cannot flip a test.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 def _short_tmp():
@@ -68,6 +87,8 @@ def _parent_env(**extra):
 @unittest.skipUnless(DARWIN_FENCE, "needs the macOS kernel fence")
 class AllowlistedChildEnvTests(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         # os.environ must not leak a pass list or a socket into the cases.
@@ -278,6 +299,8 @@ class FirmlinkSpellingTests(unittest.TestCase):
     test_same_location), so the deny must carry the plain spelling too."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         patcher = mock.patch.dict(os.environ)
@@ -358,6 +381,8 @@ class SocketRelocationTests(unittest.TestCase):
     directory) and connect through the new pathname."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.work = tempfile.TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
         patcher = mock.patch.dict(os.environ)
@@ -417,6 +442,8 @@ class FencedConnectProbeTests(unittest.TestCase):
     """Real sandbox-exec: the fenced child cannot reach the agent socket."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         patcher = mock.patch.dict(os.environ)
@@ -516,6 +543,8 @@ class SocketAliasTests(unittest.TestCase):
     cover; the profile must refuse to create one."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.work = tempfile.TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
         patcher = mock.patch.dict(os.environ)
@@ -589,6 +618,8 @@ class SocketSpellingCaseTests(unittest.TestCase):
     data-volume prefix and of the path itself must stay denied."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         patcher = mock.patch.dict(os.environ)
@@ -639,6 +670,8 @@ class SocketInspectionFailureTests(unittest.TestCase):
     deny; a path that cannot be inspected must refuse the spawn."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         patcher = mock.patch.dict(os.environ)
@@ -694,6 +727,8 @@ class GitIdentityTests(unittest.TestCase):
     explicit identity is the only one a repo-write child has."""
 
     def test_commit_inside_the_fence_carries_the_launcher_identity(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         with tempfile.TemporaryDirectory(prefix="cex_git_", dir="/private/tmp") as raw:
             root = os.path.realpath(raw)
             main = os.path.join(root, "main")
@@ -725,6 +760,8 @@ class NotifySinkAlwaysDroppedTests(unittest.TestCase):
     it, on every path that builds a child environment."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         patcher = mock.patch.dict(os.environ, {
             "OMNI_LLM_NOTIFY_CMD": "synthetic-sink", PASS_VAR: "OMNI_LLM_NOTIFY_CMD"})
         patcher.start()

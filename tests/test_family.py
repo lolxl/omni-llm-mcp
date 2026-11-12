@@ -20,9 +20,71 @@ from providers import dispatch
 from providers import health
 from providers.family import expand, is_family
 
+# Seeds v2 records; tests/offline_home.py gives this module the real gate.
+OMNI_TEST_REAL_ADMISSION = True
+
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _seed_family_catalogs():
+    """Records for the seats the walk classifies. minimal stays unlisted."""
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    from providers.config import FABLE_MODEL, SOL_CODEX_MODEL
+    specs = {
+        "codex": (["default", "alt"], [{
+            "id": SOL_CODEX_MODEL,
+            "supported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+        }]),
+        # claude has no alt home in this module. A named profile with no
+        # CLAUDE_CONFIG_DIR_<LABEL> is unsupported_profile, not a record.
+        "claude": (["default"], [{
+            "id": FABLE_MODEL,
+            "supported_efforts": ["low", "medium", "high"],
+        }, {
+            "id": "opus",
+            "supported_efforts": ["low", "medium", "high"],
+        }]),
+        "cursor": (["default", "alt"], [
+            {"id": "gpt-5.6-sol-medium"},
+            {"id": "gpt-5.6-sol-high"},
+            {"id": FABLE_MODEL + "-medium"},
+            {"id": FABLE_MODEL + "-high"},
+        ]),
+        "grok": (["default"], [{
+            "id": "grok-4.6",
+        }]),
+        "agy": (["default"], [{
+            "id": "Gemini 3.8 Flash (High)",
+        }]),
+    }
+    for provider, (profiles, rows) in specs.items():
+        models = []
+        for row in rows:
+            item = {
+                "id": row["id"],
+                "name": row["id"],
+                "routable_id": "%s/%s" % (provider, row["id"]),
+            }
+            if "supported_efforts" in row:
+                item["supported_efforts"] = row["supported_efforts"]
+            models.append(item)
+        record, _warnings = validate_strict(provider, {
+            "provider": provider,
+            "source": "live",
+            "observed_at": "2026-11-10T00:00:00Z",
+            "availability": "provider_advertised",
+            "models": models,
+        })
+        from providers.profiles import resolve_profile
+        for profile in profiles:
+            if profile != "default":
+                _overrides, err = resolve_profile(provider, profile)
+                if err:
+                    continue
+            catalog_v2.save(provider, profile, record)
 
 
 class _Fakes:
@@ -101,7 +163,7 @@ class FamilyCase(unittest.TestCase):
                     "OMNI_LLM_PROFILES_") or key in (
                     "OMNI_LLM_REQUIRE_READ_WALL", "OMNI_LLM_STATE_DIR",
                     "OMNI_LLM_CODEX_SESSIONS_DIR", "CODEX_HOME_ALT",
-                    "CURSOR_API_KEY_ALT"):
+                    "CURSOR_API_KEY_ALT", "CLAUDE_CONFIG_DIR"):
                 self._saved[key] = os.environ.pop(key)
         os.environ["OMNI_LLM_STATE_DIR"] = self.state_dir
         os.environ["OMNI_LLM_QUOTA_PROBE"] = "0"  # never spawn the real RPC in unit tests
@@ -110,19 +172,36 @@ class FamilyCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.codex_alt, ignore_errors=True)
         os.environ["CODEX_HOME_ALT"] = self.codex_alt
         os.environ["CURSOR_API_KEY_ALT"] = "fake-cursor-alt"
+        # An empty config home keeps consult off the user's settings.json,
+        # so claude is catalog-gated the way a clean account is.
+        self.claude_home = tempfile.mkdtemp(prefix="omni-claude-cfg-")
+        self.addCleanup(shutil.rmtree, self.claude_home, ignore_errors=True)
+        os.environ["CLAUDE_CONFIG_DIR"] = self.claude_home
         health.clear_all()
+        _seed_family_catalogs()
 
     def tearDown(self):
         health.clear_all()
         for key in ("OMNI_LLM_STATE_DIR", "OMNI_LLM_QUOTA_PROBE", "OMNI_LLM_CODEX_SESSIONS_DIR",
                     "OMNI_LLM_REQUIRE_READ_WALL", "CODEX_HOME_ALT",
-                    "CURSOR_API_KEY_ALT"):
+                    "CURSOR_API_KEY_ALT", "CLAUDE_CONFIG_DIR"):
             os.environ.pop(key, None)
         for key in list(os.environ):
             if key.startswith("OMNI_LLM_FAMILY_") or key.startswith(
                     "OMNI_LLM_PROFILES_"):
                 os.environ.pop(key, None)
         os.environ.update(self._saved)
+
+    def _statable_home(self):
+        """See tests/test_aliases.py: the real default login cannot be statted here."""
+        home = tempfile.mkdtemp(prefix="omni-family-home-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        os.makedirs(os.path.join(home, ".codex"))
+        patcher = mock.patch(
+            "providers.kernel_sandbox.protected_home",
+            return_value=os.path.realpath(home))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _fakes(self, fail=()):
         fakes = _Fakes(fail=fail)
@@ -203,8 +282,8 @@ class TestFamilyExpand(FamilyCase):
         self.assertIsNone(err)
         self.assertEqual(
             [(s["provider"], s["model"], s["account_profile"]) for s in seats],
-            [("codex", "codex/gpt-5.6-sol", "default"),
-             ("cursor", "cursor/gpt-5.6-sol", "default")],
+            [("codex", "codex/sol", "default"),
+             ("cursor", "cursor/sol", "default")],
         )
 
     def test_env_reorder_and_per_road_profile(self):
@@ -243,24 +322,88 @@ class TestFamilyExpand(FamilyCase):
 
 
 class TestFamilyDispatch(FamilyCase):
+    def test_logical_seat_shares_the_concrete_health_key(self):
+        from providers.config import FABLE_MODEL, SOL_CODEX_MODEL
+        alias_path = os.path.join(self.state_dir, "aliases.json")
+        self.assertFalse(os.path.exists(alias_path))
+        health.flag("codex/" + SOL_CODEX_MODEL, "default")
+        health.flag("claude/" + FABLE_MODEL, "default")
+        self.assertEqual(health.seat_kind("codex/sol", "default"), "cooling")
+        self.assertEqual(health.seat_kind("claude/fable", "default"), "cooling")
+        self.assertEqual(
+            health.pool_key("codex/sol", "default"),
+            health.pool_key("codex/" + SOL_CODEX_MODEL, "default"))
+        self.assertEqual(
+            health.pool_key("claude/fable", "default"),
+            health.pool_key("claude/" + FABLE_MODEL, "default"))
+        fakes = self._fakes()
+        res = self._dispatch(fakes, "sol@high")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["tried"][0]["model"], "codex/sol")
+        self.assertEqual(res["tried"][0]["reason"], "skipped_cooldown")
+        self.assertEqual([c["provider"] for c in fakes.calls], ["cursor"])
+
+    def test_retargeted_alias_moves_the_logical_health_key(self):
+        from providers import aliases
+        from providers.config import FABLE_MODEL, SOL_CODEX_MODEL
+        aliases.set_alias("family.sol.codex", "gpt-alias-target")
+        aliases.set_alias("family.fable.claude", "claude-alias-target")
+        health.flag("codex/" + SOL_CODEX_MODEL, "default")
+        health.flag("claude/" + FABLE_MODEL, "default")
+        self.assertEqual(health.seat_kind("codex/sol", "default"), "healthy")
+        self.assertEqual(health.seat_kind("claude/fable", "default"), "healthy")
+        health.clear_all()
+        health.flag("codex/gpt-alias-target", "default")
+        health.flag("claude/claude-alias-target", "default")
+        self.assertEqual(health.seat_kind("codex/sol", "default"), "cooling")
+        self.assertEqual(health.seat_kind("claude/fable", "default"), "cooling")
+        self.assertEqual(
+            health.pool_key("codex/sol", "default"),
+            health.pool_key("codex/gpt-alias-target", "default"))
+        self.assertEqual(
+            health.pool_key("claude/fable", "default"),
+            health.pool_key("claude/claude-alias-target", "default"))
+        self.assertNotEqual(
+            health.pool_key("codex/sol", "default"),
+            health.pool_key("codex/" + SOL_CODEX_MODEL, "default"))
+
+    def test_today_gate_logical_health_uses_the_builtin(self):
+        from providers import aliases
+        from providers.config import SOL_CODEX_MODEL
+        aliases.set_alias("family.sol.codex", "gpt-alias-target")
+        health.flag("codex/" + SOL_CODEX_MODEL, "default")
+        with mock.patch.dict(os.environ, {"OPENAI_BASE_URL": "http://127.0.0.1:9"}):
+            self.assertEqual(health.seat_kind("codex/sol", "default"), "cooling")
+            self.assertEqual(
+                health.seat_kind("codex/" + SOL_CODEX_MODEL, "default"), "cooling")
+            self.assertEqual(
+                health.pool_key("codex/sol", "default"),
+                health.pool_key("codex/" + SOL_CODEX_MODEL, "default"))
+            fakes = self._fakes()
+            res = self._dispatch(fakes, "sol@high")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["tried"][0]["model"], "codex/sol")
+        self.assertEqual(res["tried"][0]["reason"], "skipped_cooldown")
+        self.assertEqual([c["provider"] for c in fakes.calls], ["cursor"])
+
     def test_a_sol_high_skips_cooling_codex(self):
-        health.flag("codex/gpt-5.6-sol", "default")
+        health.flag("codex/sol", "default")
         fakes = self._fakes()
         res = self._dispatch(fakes, "sol@high")
         self.assertTrue(res.get("ok"), res)
         self.assertEqual(res["seat"]["provider"], "cursor")
         self.assertEqual(res["seat"]["family"], "sol")
-        self.assertEqual(res["seat"]["model"], "cursor/gpt-5.6-sol")
+        self.assertEqual(res["seat"]["model"], "cursor/sol")
         self.assertEqual(res["tried"][0], {
-            "model": "codex/gpt-5.6-sol",
+            "model": "codex/sol",
             "account_profile": "default",
             "reason": "skipped_cooldown",
         })
         self.assertEqual([c["provider"] for c in fakes.calls], ["cursor"])
 
     def test_b_both_flagged_dispatches_cooling_in_order(self):
-        health.flag("codex/gpt-5.6-sol", "default")
-        health.flag("cursor/gpt-5.6-sol", "default")
+        health.flag("codex/sol", "default")
+        health.flag("cursor/sol", "default")
         fakes = self._fakes(fail=("codex",))
         res = self._dispatch(fakes, "sol")
         self.assertTrue(res.get("ok"), res)
@@ -269,16 +412,26 @@ class TestFamilyDispatch(FamilyCase):
 
     def test_c_fable_minimal_no_eligible_no_agy(self):
         fakes = self._fakes()
+
+        async def claude(prompt, model, timeout_s, account_profile="default",
+                         effort=None, **_k):
+            fakes._record("claude", model, account_profile, effort)
+            return {
+                "ok": False,
+                "reason": "unsupported_effort",
+                "detail": "effort: minimal is not admitted. "
+                          "models refresh --provider claude --profile default",
+                "account_retry_safe": False,
+            }
+
+        fakes.claude = claude
         res = self._dispatch(fakes, "fable@minimal")
         self.assertFalse(res.get("ok"), res)
-        self.assertEqual(res["reason"], "no_eligible_seat")
-        reasons = [t["reason"] for t in res["tried"]]
-        self.assertEqual(reasons, ["unsupported_effort", "unsupported_effort"])
-        models = [t["model"] for t in res["tried"]]
-        self.assertEqual(models, [
-            "claude/claude-fable-5-1", "cursor/claude-fable-5-1",
-        ])
-        self.assertEqual(fakes.calls, [])
+        # The provider's catalog refusal ends the walk. Later seats do not run.
+        self.assertEqual(res["reason"], "unsupported_effort")
+        self.assertIn(
+            "models refresh --provider claude --profile default", res["detail"])
+        self.assertEqual([c["provider"] for c in fakes.calls], ["claude"])
 
     def test_d_fable_require_read_wall(self):
         fakes = self._fakes()
@@ -317,6 +470,7 @@ class TestFamilyDispatch(FamilyCase):
         self.assertEqual(fakes.calls, [])
 
     def test_f_call_level_alt_reaches_every_runner(self):
+        self._statable_home()
         fakes = self._fakes(fail=("codex",))
         res = self._dispatch(fakes, "sol", account_profile="alt")
         self.assertTrue(res.get("ok"), res)
@@ -327,6 +481,7 @@ class TestFamilyDispatch(FamilyCase):
         self.assertEqual(res["seat"]["account_profile"], "alt")
 
     def test_g_env_per_road_profile_on_default_call(self):
+        self._statable_home()
         fakes = self._fakes(fail=("codex",))
         res = self._dispatch(
             fakes, "sol",
@@ -355,7 +510,7 @@ class TestFamilyDispatch(FamilyCase):
         self.assertEqual(res["seat"]["provider"], "grok")
         self.assertEqual(
             [t["model"] for t in res["tried"]],
-            ["codex/gpt-5.6-sol", "cursor/gpt-5.6-sol"],
+            ["codex/sol", "cursor/sol"],
         )
         self.assertEqual(
             [c["provider"] for c in fakes.calls],
@@ -389,6 +544,7 @@ class TestNoEligibleSeatEnvelope(unittest.TestCase):
     def test_detail_names_every_seat_and_reason(self):
         from providers import dispatch as dispatch_mod
         import asyncio
+        _seed_family_catalogs()
         with mock.patch.dict(os.environ, {"OMNI_LLM_REQUIRE_READ_WALL": "1"}), \
              mock.patch.object(dispatch_mod, "backends_snapshot", return_value={
                  "claude": {"read_wall": False},
@@ -397,5 +553,5 @@ class TestNoEligibleSeatEnvelope(unittest.TestCase):
             res = asyncio.run(dispatch_mod.dispatch_llm_request(
                 "hi", "fable", 30, [], "default"))
         self.assertEqual(res["reason"], "no_eligible_seat")
-        self.assertIn("claude/claude-fable-5-1 (read_wall_required)", res["detail"])
-        self.assertIn("cursor/claude-fable-5-1 (read_wall_required)", res["detail"])
+        self.assertIn("claude/fable (read_wall_required)", res["detail"])
+        self.assertIn("cursor/fable (read_wall_required)", res["detail"])

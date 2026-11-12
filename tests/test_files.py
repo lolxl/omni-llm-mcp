@@ -60,6 +60,7 @@ from providers import host_fence as host_fence_mod  # noqa: E402
 from providers import openai_compat as openai_mod  # noqa: E402
 from providers import route as route_mod  # noqa: E402
 from providers import source_load as source_load_mod  # noqa: E402
+from tests import offline_home
 
 _REAL_WHICH = shutil.which
 FILES_CLIS = ("codex", "grok")
@@ -103,6 +104,24 @@ def _accepts(func, name):
 HAS_BINARY_READER = callable(getattr(source_load_mod, "open_binary_under_roots", None))
 CODEX_TAKES_FILES = _accepts(codex_mod.run_codex_subprocess, "files")
 GROK_TAKES_FILES = _accepts(grok_mod.run_grok_subprocess, "files")
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +247,10 @@ def flag_values(argv, flag):
 
 class FilesTestCase(unittest.TestCase):
     """Temp-root helpers + envelope assertions shared by every files= test."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def mkdir(self, prefix="omni_files_"):
         """A realpath'd temp dir, so abspath(dir) == dir on macOS (/var symlink)."""
@@ -489,6 +512,8 @@ class TestGrokNoFilesRegression(FilesTestCase):
 @unittest.skipUnless(GROK_TAKES_FILES, "run_grok_subprocess(files=...) not implemented yet")
 class TestGrokFilesHappyPath(FilesTestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.root = self.mkdir("omni_files_root_")
         self.png = self.write_file(self.root, "red.png")
 
@@ -669,6 +694,8 @@ class TestGrokFilesFences(FilesTestCase):
 @unittest.skipUnless(GROK_TAKES_FILES, "run_grok_subprocess(files=...) not implemented yet")
 class TestGrokTextFiles(FilesTestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.root = self.mkdir("omni_files_root_")
 
     def call(self, files, prompt="summarise the attachment", roots=None):

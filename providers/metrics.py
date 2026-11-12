@@ -56,8 +56,23 @@ def metrics_enabled():
     return os.environ.get(ENV_METRICS, "1") != "0"
 
 
+_entry_override = None
+
+
+def set_entry(kind):
+    """Pin the entry kind for this process (``None`` restores detection).
+
+    `omni mcp` runs the MCP server inside the CLI executable, so the
+    ``__main__`` / argv[0] heuristic below would log it as \"cli\".
+    """
+    global _entry_override
+    _entry_override = kind
+
+
 def detect_entry():
     """Return \"cli\" when invoked via omni_cli, else \"mcp\"."""
+    if _entry_override:
+        return _entry_override
     main = sys.modules.get("__main__")
     if main is not None:
         main_file = getattr(main, "__file__", None) or ""

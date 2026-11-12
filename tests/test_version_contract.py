@@ -35,7 +35,7 @@ class VersionTests(unittest.TestCase):
         r = _run("--version")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "omni %s\n" % __version__)
-        self.assertEqual(r.stdout.strip(), "omni 0.10.0")
+        self.assertEqual(r.stdout.strip(), "omni 0.11.0")
 
     def test_server_version_is_the_same_source(self):
         self.assertEqual(server.SERVER_VERSION, __version__)

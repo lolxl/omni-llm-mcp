@@ -5,6 +5,7 @@ import asyncio
 import glob
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -16,6 +17,63 @@ from providers import dispatch as dispatch_mod
 from providers.route import resolve_route
 from providers.usage import extract_cli_result, inband_error, normalize_usage
 from tests.test_agent import FakeRunCli, depth
+
+# Seeds v2 records; tests/offline_home.py gives this module the real gate.
+OMNI_TEST_REAL_ADMISSION = True
+
+
+_CURSOR_STATE = None
+_STATE_PATCH = None
+
+
+def _seed_cursor(profile="default"):
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    from providers.config import FABLE_MODEL
+    ids = [
+        "composer-2.5",
+        "gpt-5.6-sol-medium",
+        "gpt-5.6-sol-high",
+        "gpt-5.6-sol-xhigh",
+        FABLE_MODEL,
+        FABLE_MODEL + "-max",
+        "claude-opus-5-high",
+        "gpt-5.5-extra-high",
+        "claude-4.6-opus-max-thinking",
+        "gpt-5.6-sol-none",
+    ]
+    record, _warnings = validate_strict("cursor", {
+        "provider": "cursor",
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": [{
+            "id": model_id,
+            "name": model_id,
+            "routable_id": "cursor/%s" % model_id,
+        } for model_id in ids],
+    })
+    catalog_v2.save("cursor", profile, record)
+
+
+
+def setUpModule():
+    # Scoped to this module: the one-process runner imports every module first.
+    global _CURSOR_STATE, _STATE_PATCH
+    _CURSOR_STATE = tempfile.mkdtemp(prefix="omni-cursor-state-")
+    _STATE_PATCH = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": _CURSOR_STATE})
+    _STATE_PATCH.start()
+    try:
+        _seed_cursor()
+    except BaseException:
+        # tearDownModule does not run when setUpModule raises.
+        tearDownModule()
+        raise
+
+
+def tearDownModule():
+    _STATE_PATCH.stop()
+    shutil.rmtree(_CURSOR_STATE, ignore_errors=True)
 
 
 CURSOR_OK = json.dumps({
@@ -29,9 +87,9 @@ CURSOR_OK = json.dumps({
 
 class TestCursorAliases(unittest.TestCase):
     def test_short_names(self):
-        self.assertEqual(cursor_mod.alias_model("fable"), "claude-fable-5-1")
+        self.assertEqual(cursor_mod.alias_model("fable"), config_mod.FABLE_MODEL)
         self.assertEqual(cursor_mod.alias_model("sol"), "gpt-5.6-sol")
-        self.assertEqual(cursor_mod.alias_model("Fable"), "claude-fable-5-1")
+        self.assertEqual(cursor_mod.alias_model("Fable"), config_mod.FABLE_MODEL)
         self.assertEqual(cursor_mod.alias_model("SOL"), "gpt-5.6-sol")
 
     def test_verbatim_slugs(self):
@@ -48,7 +106,7 @@ class TestCursorAliases(unittest.TestCase):
     def test_envelope_model_stays_on_cursor_prefix(self):
         self.assertEqual(cursor_mod.envelope_model("sol"), "cursor/gpt-5.6-sol")
         self.assertEqual(cursor_mod.envelope_model("fable"),
-                         "cursor/claude-fable-5-1")
+                         "cursor/" + config_mod.FABLE_MODEL)
         self.assertEqual(cursor_mod.envelope_model("composer-2.5"),
                          "cursor/composer-2.5")
         self.assertEqual(resolve_route(cursor_mod.envelope_model("sol"))
@@ -123,6 +181,7 @@ class TestCursorConsult(unittest.TestCase):
                                   return_value="/fake/bin/cursor-agent"), \
                 mock.patch.object(cursor_mod, "env_depth",
                                   return_value=int(depth_value)):
+            _seed_cursor()
             return asyncio.run(
                 cursor_mod.run_cursor_subprocess(prompt, model, 30,
                                                  effort=effort))
@@ -132,7 +191,7 @@ class TestCursorConsult(unittest.TestCase):
         env = self._run(fake, model="fable")
         self.assertTrue(env.get("ok"), env)
         self.assertEqual(env.get("text"), "HI")
-        self.assertEqual(env.get("model"), "cursor/claude-fable-5-1")
+        self.assertEqual(env.get("model"), "cursor/" + config_mod.FABLE_MODEL)
         argv = fake.argv
         self.assertEqual(argv[0], "/fake/bin/cursor-agent")
         self.assertIn("-p", argv)
@@ -146,7 +205,7 @@ class TestCursorConsult(unittest.TestCase):
         self.assertEqual(fake.kwargs.get("cwd"), workspace)
         self.assertEqual(
             fake.kwargs.get("env", {}).get(config_mod.ENV_DEPTH), "1")
-        self.assertEqual(argv[argv.index("--model") + 1], "claude-fable-5-1")
+        self.assertEqual(argv[argv.index("--model") + 1], config_mod.FABLE_MODEL)
         self.assertNotIn("--force", argv)
         self.assertNotIn("--yolo", argv)
         self.assertNotIn("--approve-mcps", argv)
@@ -312,9 +371,6 @@ class TestCursorConsult(unittest.TestCase):
         env = self._run(fake, model="sol@high", effort="low")
         self.assertFalse(env.get("ok"), env)
         self.assertEqual(env.get("reason"), "unsupported_effort")
-        detail = env.get("detail", "")
-        self.assertIn("high", detail)
-        self.assertIn("low", detail)
         self.assertEqual(fake.calls, [])
 
     def test_at_bogus_effort_names_the_flag(self):
@@ -322,18 +378,14 @@ class TestCursorConsult(unittest.TestCase):
         env = self._run(fake, model="sol@bogus")
         self.assertFalse(env.get("ok"), env)
         self.assertEqual(env.get("reason"), "unsupported_effort")
-        detail = env.get("detail", "")
-        self.assertIn("--effort", detail)
-        for token in config_mod.EFFORT_LEVELS:
-            self.assertIn(token, detail)
+        self.assertIn("bogus", env.get("detail", ""))
         self.assertEqual(fake.calls, [])
 
     def test_at_effort_on_model_without_variants_is_loud(self):
         fake = FakeRunCli(stdout=CURSOR_OK)
         env = self._run(fake, model="composer-2.5@high")
         self.assertFalse(env.get("ok"), env)
-        self.assertEqual(env.get("reason"), "unsupported_effort")
-        self.assertIn("no effort variants", env.get("detail", ""))
+        self.assertEqual(env.get("reason"), "effort_already_encoded")
         self.assertEqual(fake.calls, [])
 
     def test_effort_token_is_case_insensitive(self):
@@ -341,7 +393,7 @@ class TestCursorConsult(unittest.TestCase):
         env = self._run(fake, model="fable", effort="  MAX ")
         self.assertTrue(env.get("ok"), env)
         self.assertEqual(fake.argv[fake.argv.index("--model") + 1],
-                         "claude-fable-5-1-max")
+                         config_mod.FABLE_MODEL + "-max")
 
     def test_omitted_effort_leaves_argv_untouched(self):
         # fable is not in CURSOR_DEFAULT_EFFORT; sol is the exception.
@@ -350,7 +402,7 @@ class TestCursorConsult(unittest.TestCase):
         blank = FakeRunCli(stdout=CURSOR_OK)
         self._run(blank, model="fable", effort="   ")
         self.assertEqual(plain.argv[plain.argv.index("--model") + 1],
-                         "claude-fable-5-1")
+                         config_mod.FABLE_MODEL)
 
         def scrub(argv):
             argv = list(argv)
@@ -363,16 +415,14 @@ class TestCursorConsult(unittest.TestCase):
         fake = FakeRunCli(stdout=CURSOR_OK)
         env = self._run(fake, model="composer-2.5", effort="high")
         self.assertFalse(env.get("ok"), env)
-        self.assertEqual(env.get("reason"), "unsupported_effort")
-        self.assertIn("no effort variants", env.get("detail", ""))
+        self.assertEqual(env.get("reason"), "effort_already_encoded")
         self.assertEqual(fake.calls, [])
 
     def test_effort_on_an_already_encoded_slug_is_loud(self):
         fake = FakeRunCli(stdout=CURSOR_OK)
         env = self._run(fake, model="gpt-5.6-sol-xhigh", effort="low")
         self.assertFalse(env.get("ok"), env)
-        self.assertEqual(env.get("reason"), "unsupported_effort")
-        self.assertIn("already encodes effort", env.get("detail", ""))
+        self.assertEqual(env.get("reason"), "effort_already_encoded")
         self.assertEqual(fake.calls, [])
 
     def test_unknown_effort_token_is_loud(self):
@@ -387,7 +437,7 @@ class TestCursorConsult(unittest.TestCase):
                 mock.patch.object(cursor_mod, "env_depth", return_value=0):
             env = asyncio.run(cursor_mod.run_cursor_subprocess(
                 "hi", "composer-2.5", 30, effort="high"))
-        self.assertEqual(env.get("reason"), "unsupported_effort")
+        self.assertEqual(env.get("reason"), "effort_already_encoded")
 
     def test_envelope_model_redispatches_at_the_same_strength(self):
         first = FakeRunCli(stdout=CURSOR_OK)
@@ -406,14 +456,14 @@ class TestCursorConsult(unittest.TestCase):
         fake = FakeRunCli(stdout=CURSOR_OK)
         env = self._run(fake, model="gpt-5.6-sol-fast", effort="xhigh")
         self.assertFalse(env.get("ok"), env)
-        self.assertEqual(env.get("reason"), "unsupported_effort")
+        self.assertEqual(env.get("reason"), "unsupported_model")
         self.assertEqual(fake.calls, [])
 
     def test_encoded_none_slug_is_named_as_already_encoded(self):
         fake = FakeRunCli(stdout=CURSOR_OK)
         env = self._run(fake, model="gpt-5.6-sol-none", effort="low")
         self.assertFalse(env.get("ok"), env)
-        self.assertIn("already encodes effort", env.get("detail", ""))
+        self.assertIn("already encoded", env.get("detail", ""))
 
     def test_family_token_ceiling_at_the_subprocess_boundary(self):
         ok_run = FakeRunCli(stdout=CURSOR_OK)
@@ -442,7 +492,7 @@ class TestCursorConsult(unittest.TestCase):
         fake = FakeRunCli(stdout=CURSOR_OK)
         env = self._run(fake, model="composer-2.5", effort="high",
                         depth_value="1")
-        self.assertEqual(env.get("reason"), "unsupported_effort")
+        self.assertEqual(env.get("reason"), "effort_already_encoded")
 
     def test_inband_error_is_not_success(self):
         payload = json.dumps({
@@ -496,9 +546,9 @@ class TestCursorRoute(unittest.TestCase):
             env = asyncio.run(dispatch_mod.route_to_provider(
                 "hi", "cursor/fable", 30, None, "default"))
         self.assertTrue(env.get("ok"), env)
-        self.assertEqual(env.get("model"), "cursor/claude-fable-5-1")
+        self.assertEqual(env.get("model"), "cursor/" + config_mod.FABLE_MODEL)
         self.assertEqual(fake.argv[fake.argv.index("--model") + 1],
-                         "claude-fable-5-1")
+                         config_mod.FABLE_MODEL)
         self.assertEqual(resolve_route(env["model"])["provider"], "cursor")
 
 
@@ -516,6 +566,7 @@ class TestCursorMetricsSeat(unittest.TestCase):
                 mock.patch.object(cursor_mod, "env_depth", return_value=0), \
                 depth(None):
             os.environ.pop("OMNI_EGRESS_GATE", None)
+            _seed_cursor()
             env = asyncio.run(dispatch_mod.call_tool("llm_generate", {
                 "prompt": "hi",
                 "model": "cursor/sol",

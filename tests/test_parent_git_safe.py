@@ -18,15 +18,22 @@ import unittest
 from unittest import mock
 
 from providers import agent_lane, git_safe, host_fence, jobs, kernel_sandbox
+from tests import offline_home
 
 REAL_GIT = shutil.which("git")
 
 
 _STATE_PATCH = None
 _STATE_DIR = None
+_HOME = None
 
 
 def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
     # #168: a write-mode run records a repository's protected branches under the
     # state dir. Keep these fixtures' repositories out of the real one.
     global _STATE_PATCH, _STATE_DIR
@@ -37,14 +44,20 @@ def setUpModule():
 
 def tearDownModule():
     import shutil
-    _STATE_PATCH.stop()
-    shutil.rmtree(_STATE_DIR, ignore_errors=True)
+    try:
+        _STATE_PATCH.stop()
+        shutil.rmtree(_STATE_DIR, ignore_errors=True)
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 
 @unittest.skipUnless(REAL_GIT, "git not on PATH")
 class ParentGitCase(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.root = os.path.realpath(tempfile.mkdtemp(prefix="omni157_"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         patcher = mock.patch.dict(os.environ, {
@@ -446,8 +459,9 @@ class TestSnapshotMeaning(ParentGitCase):
         self.git(wd, "add", "d.txt")
         with open(os.path.join(wd, "d.txt"), "w") as handle:
             handle.write("staged then edited")               # 'MM'
-        # .strip() mirrors agent_lane._git, which strips the whole stream
-        plain = self.git(wd, "status", "--porcelain", "--untracked-files=all").stdout.strip()
+        # rstrip() mirrors agent_lane._git(keep_lead=True): the first line's
+        # leading status space (" M a.txt") must survive (issue #243)
+        plain = self.git(wd, "status", "--porcelain", "--untracked-files=all").stdout.rstrip()
         expected = agent_lane._parse_porcelain(plain)
         snap = agent_lane._workspace_snapshot(wd)
         self.assertEqual(snap["state"], "ok")
@@ -478,6 +492,15 @@ class TestSnapshotMeaning(ParentGitCase):
 
 class TestArgvPins(ParentGitCase):
     def test_every_parent_git_call_carries_the_safe_flags(self):
+        # A full-suite run can fill this from an earlier test, hiding the probe.
+        saved_versions = dict(git_safe._version_cache)
+
+        def restore_version_cache():
+            git_safe._version_cache.clear()
+            git_safe._version_cache.update(saved_versions)
+
+        self.addCleanup(restore_version_cache)
+        git_safe._version_cache.clear()
         calls = []
         real_run = subprocess.run
 
@@ -842,8 +865,9 @@ class TestWriteAccountingEdges(ParentGitCase):
             count, detail = agent_lane._workspace_writes(wd, old, new)
         self.assertIsNone(count)
 
-    def test_transforming_filter_may_undercount_but_expect_writes_stays_loud(self):
-        """Pins the documented trade-off of blanking repository filters."""
+    def test_transforming_filter_dirty_file_rewrite_still_counts(self):
+        """With filters blanked the file shows modified before the run, and a
+        content rewrite is still counted through the content digest."""
         import asyncio
         wd = self.repo("lfsish")
         self.attributes(wd, "up")
@@ -874,9 +898,9 @@ class TestWriteAccountingEdges(ParentGitCase):
             env = asyncio.run(agent_lane.run_agent(
                 task="do it", model="claude/sonnet", workdir=wd, timeout_s=30,
                 expect_writes=True))
-        self.assertEqual(env.get("workspace_writes"), 0, env)
-        self.assertEqual(env.get("reason"), "no_workspace_writes", env)
-        self.assertFalse(env.get("ok"))
+        self.assertEqual(env.get("workspace_writes"), 1, env)
+        self.assertTrue(env.get("ok"), env)
+        self.assertNotIn("reason", env)
 
 
 

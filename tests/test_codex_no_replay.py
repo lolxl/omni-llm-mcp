@@ -15,6 +15,22 @@ import unittest
 from unittest import mock
 
 from providers import codex_accounts as accounts, health
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 MODEL = "codex/synthetic-model"
 
@@ -29,6 +45,8 @@ def auth_stream():
 
 class NoReplayCase(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         temp = tempfile.TemporaryDirectory(prefix="omni-noreplay-")
         self.addCleanup(temp.cleanup)
         self.root = os.path.realpath(temp.name)

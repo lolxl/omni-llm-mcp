@@ -383,20 +383,29 @@ async def run_agy(prompt, model, timeout_s, files=None, account_profile="default
     _profile_dir, profile_error = _agy_profile_dir(account_profile)
     if profile_error:
         return profile_error
+    from providers import admission
+    decision = admission.consider(
+        "agy", account_profile, model, effort,
+        isolated=False, host_env=os.environ, settings_files=())
+    if admission.is_terminal(decision):
+        return admission.refusal_envelope("agy", account_profile, decision)
+    model, effort, _catalog = admission.bound_call(model, effort, decision)
     if effort is not None:
         if files:
             prompt = str(prompt) + "\n\nFiles to analyze:\n" + "\n".join(files)
-        return await run_agy_subprocess(
+        result = await run_agy_subprocess(
             prompt, model, timeout_s, account_profile, effort=effort)
+        return admission.stamp(result, decision)
 
     if HAS_SDK and platform.system() == "Darwin":
         log("agy SDK skipped on macOS: the subprocess lane runs inside the host fence")
     elif HAS_SDK:
         res = await run_agy_sdk(prompt, model, timeout_s, files, account_profile)
         if res.get("reason") != "sdk_unavailable":
-            return res
+            return admission.stamp(res, decision)
         log("SDK cannot honor model=%r; falling back to agy subprocess" % model)
 
     if files:
         prompt += "\n\nFiles to analyze:\n" + "\n".join(files)
-    return await run_agy_subprocess(prompt, model, timeout_s, account_profile)
+    result = await run_agy_subprocess(prompt, model, timeout_s, account_profile)
+    return admission.stamp(result, decision)

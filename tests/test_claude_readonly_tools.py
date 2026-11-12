@@ -24,6 +24,7 @@ from providers import agent_lane  # noqa: E402
 from providers import claude as claude_mod  # noqa: E402
 from providers import health  # noqa: E402
 import tests.test_provider_accounts as tpa  # noqa: E402
+from tests import offline_home
 
 _REAL_WHICH = shutil.which
 CONSULT_DENIALS = ("Bash", "Write", "Edit", "NotebookEdit",
@@ -31,6 +32,24 @@ CONSULT_DENIALS = ("Bash", "Write", "Edit", "NotebookEdit",
 # "Agent" is the current name of "Task"; the second layer denies both.
 READ_ONLY_DENIALS = CONSULT_DENIALS + ("Agent",)
 READ_ONLY_TOOLS = "Read,Grep,Glob"
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 class FakeRunCli:
@@ -70,6 +89,10 @@ def _no_depth():
 
 
 class ReadOnlyToolsTest(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _workdir(self):
         d = os.path.realpath(tempfile.mkdtemp(prefix="omni_ro_tools_"))
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
@@ -174,6 +197,11 @@ class ReadOnlyToolsTest(unittest.TestCase):
 
 class ReadOnlyApiAndEnvTest(tpa.ApiFixture):
     """API-key account and plugin-selector env, on the shared fake-binary fixture."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     def test_api_key_read_only_run_carries_empty_sources_and_settings_file(self):
         health.flag(self.model, "a")

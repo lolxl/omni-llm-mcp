@@ -19,7 +19,7 @@ Supported backends:
 
 ## Why
 
-- **Zero dependencies.** Pure standard library on the system `python3` (3.7+).
+- **Zero dependencies.** Pure standard library on the system `python3` (3.9+).
   No virtualenv, no `pip install`.
 - **Ride your subscriptions.** CLI backends use the vendor CLI's own login, so no
   metered API key is needed for most of them.
@@ -31,7 +31,7 @@ Supported backends:
 
 ## Install
 
-You need `python3` 3.7 or later. Log in once, in a real terminal, to each vendor CLI
+You need `python3` 3.9 or later. Log in once, in a real terminal, to each vendor CLI
 you want to use.
 
 ### As a plugin
@@ -54,7 +54,7 @@ grok plugin install https://github.com/lolxl/omni-llm-mcp --trust
 
 Restart the client after installing. The four tools then appear under the
 `omni-llm` MCP server. Ask for them in plain language ("ask grok-4.6 to review this
-diff") or name the tool directly (`llm_generate` with `model: "codex/gpt-5.6-sol"`).
+diff") or name the tool directly (`llm_generate` with `model: "codex/gpt-6.1-sol"`).
 
 If you already registered the server by hand, remove that entry first so the tools
 do not appear twice. For example, in Claude Code: `claude mcp remove omni-llm`.
@@ -93,7 +93,46 @@ claude mcp add --scope user omni-llm -- python3 "$HOME/omni-llm-mcp/server.py"
 
 ### The `omni` CLI
 
-The plugins do not install the CLI. Link it from a clone:
+The plugins do not install the CLI. Install it with [pipx](https://pipx.pypa.io/),
+which keeps it in its own environment and puts `omni` on your `PATH`:
+
+```bash
+pipx install git+https://github.com/lolxl/omni-llm-mcp
+omni --version
+omni contract        # the interfaces this install offers, with contract_version
+omni models refresh --provider all --profile default
+omni models check
+```
+
+Dispatch checks claude, codex, grok, cursor, and agy against that profile's catalog record before a vendor runs, and refuses a missing record, when that account is checked against its catalog. A Claude, Codex, or Grok run whose profile home is not labeled, whose authentication environment differs from the profile's, or whose Claude settings change the account or endpoint (for example a redirected endpoint or `apiKeyHelper`, #236) or cannot be read keeps the previous behavior and is not checked against the list. See [docs/model-catalogs.md](docs/model-catalogs.md).
+
+Install it with pipx, not into a shared environment: the wheel carries a top-level
+`providers` package. The wheel does not include the `server.py` file (plugins and
+clones launch that one by path); the MCP server itself ships inside the wheel as
+`providers/mcp_server.py`.
+
+### The MCP server from the pipx install: `omni mcp`
+
+`omni mcp` runs the same MCP stdio server as `server.py`, so one pipx install gives
+you both the CLI and the server. It speaks JSON-RPC on stdin/stdout and exits when
+stdin closes. Register it in a client with command `omni` and args `mcp`; for
+Claude Code:
+
+```bash
+claude mcp add --scope user omni-llm -- omni mcp
+```
+
+For any other MCP client, register a stdio server with command `omni` and args
+`mcp`. Notes:
+
+- The client must find `omni` on its `PATH` (pipx puts it in `~/.local/bin`).
+  Clients started from a desktop launcher often do not have that directory; use
+  the absolute path to `omni` as the command if the server does not connect.
+- Restart the client after upgrading omni; a running server does not reload.
+- Do not register both the plugin and a manual `omni mcp` server under the same
+  name (`omni-llm`). Remove one first, so the tools do not appear twice.
+
+To run from a clone instead, link it:
 
 ```bash
 ln -sf "$HOME/omni-llm-mcp/omni_cli.py" ~/.local/bin/omni
@@ -118,10 +157,10 @@ never `0`.
 
 - **Prefix routing.** The model name picks the backend (see the table above).
 - **Fallback chains (opt-in).** A comma-separated list such as
-  `"codex/gpt-5.6-sol,grok-4.6,ollama/llama3"` is tried left to right. A single model
+  `"codex/gpt-6.1-sol,grok-4.6,ollama/llama3"` is tried left to right. A single model
   never falls back.
 - **Families.** The bare names `sol` and `fable` expand to an ordered list of seats
-  across backends (for example `sol` → `codex/gpt-5.6-sol`, then
+  across backends (for example `sol` → `codex/gpt-6.1-sol`, then
   `cursor/gpt-5.6-sol`). Override the order with `OMNI_LLM_FAMILY_<NAME>`.
 - **Effort.** `effort` accepts `low` / `medium` / `high` / `xhigh`; some backends
   also accept `minimal` or `max`. Unsupported values are rejected, not ignored.

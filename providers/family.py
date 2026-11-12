@@ -6,9 +6,9 @@ when the whole bare name — after an ``@effort`` split — equals a key in
 ``config.FAMILIES``. ``cursor/sol`` is cursor's own alias, not a family.
 
 Each seat is ``{family, provider, model, account_profile}``. ``model`` is
-the routable slug (``codex/gpt-5.6-sol``, ``cursor/gpt-5.6-sol``,
-``claude/claude-fable-5-1``). The model-id always comes from the static
-table; env cannot change it.
+the logical id (``codex/sol``, ``cursor/sol``, ``claude/fable``). The alias
+file is not read here. Admission, after the selected account's gate, maps
+that id to the built-in or to the file. Env cannot change it.
 
 Env override ``OMNI_LLM_FAMILY_<NAME.upper()>`` is a comma list of
 ``road[:profile]``. Every listed road must appear in that family's static
@@ -100,10 +100,70 @@ def _parse_override(raw, table, var):
     return out, None
 
 
+def logical_target(provider, model):
+    """``(family, builtin_model_id)`` when ``model`` is that seat's logical id.
+
+    ``claude/fable`` arrives here as ``fable`` after the road prefix is
+    stripped. A concrete catalog id is not a family key and returns None.
+    This does not read the alias file.
+    """
+    if not isinstance(model, str):
+        return None
+    key = _family_key(model)
+    for road, model_id in FAMILIES.get(key) or ():
+        if road == provider:
+            return key, model_id
+    return None
+
+
+def _attempt_gate(provider, profile):
+    """The gate ``admission.gate`` returns for this seat's attempt."""
+    from providers import admission, dispatch
+    name = "default" if profile in (None, "") else str(profile)
+    return admission.gate(
+        provider, name,
+        isolated=dispatch._attempt_isolated(provider, name, False),
+        host_env=os.environ,
+        settings_files=dispatch._consult_settings(provider, name),
+    )
+
+
+def health_model(model, profile=None):
+    """Concrete ``road/id`` a Codex or Claude logical seat shares with health.
+
+    The id is the model admission sends for that attempt. Today's gate sends
+    the built-in and does not read the alias file. The catalog gate sends
+    the alias file's target, or the built-in when that file is absent or
+    refused. A concrete catalog id, and every Cursor seat, returns None.
+    Cursor keeps its billing-pool key.
+    """
+    text = "" if model is None else str(model)
+    if "/" not in text:
+        return None
+    provider, remainder = text.split("/", 1)
+    if provider not in ("codex", "claude"):
+        return None
+    logical = logical_target(provider, remainder)
+    if not logical:
+        return None
+    family, builtin = logical
+    target = builtin
+    if _attempt_gate(provider, profile) != "today":
+        try:
+            from providers.aliases import AliasError, effective
+            target = effective().get("family.%s.%s" % (family, provider))
+        except AliasError:
+            target = builtin
+        if not isinstance(target, str) or not target.strip():
+            target = builtin
+    return "%s/%s" % (provider, target)
+
+
 def expand(name, account_profile):
     """Expand a family name into ``(seats, err)``.
 
     ``seats`` is a list of dicts; ``err`` is a LOUD envelope or ``None``.
+    Seats carry the logical id. They do not read the alias file.
     """
     key = _family_key(name)
     table = FAMILIES.get(key)
@@ -122,7 +182,7 @@ def expand(name, account_profile):
     call_default = _is_default_profile(account_profile)
     call_profile = _norm_profile(account_profile)
     seats = []
-    for road, env_profile, model_id in entries:
+    for road, env_profile, _model_id in entries:
         if call_default:
             profile = env_profile if env_profile else "default"
         else:
@@ -130,7 +190,7 @@ def expand(name, account_profile):
         seats.append({
             "family": key,
             "provider": road,
-            "model": "%s/%s" % (road, model_id),
+            "model": "%s/%s" % (road, key),
             "account_profile": profile,
         })
     return seats, None

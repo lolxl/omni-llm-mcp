@@ -36,6 +36,7 @@ from providers.errors import (
     classify_cli_error,
     exception_detail,
     safe_detail,
+    strip_signin_expiry_warning,
     local_before_spawn,
     local_request_before_spawn,
     note_spawned,
@@ -50,6 +51,31 @@ from providers.usage import extract_cli_result, inband_error
 # lanes import these two constants (single source).
 READ_ONLY_TOOLS = "Read,Grep,Glob"
 READ_ONLY_DISALLOWED = "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent"
+
+
+def claude_config_home(account_profile="default", account_home=None):
+    """Config directory whose user settings this attempt may load."""
+    if account_home:
+        return account_home
+    overrides, err = resolve_profile("claude", account_profile or "default")
+    if not err and overrides.get("CLAUDE_CONFIG_DIR"):
+        return overrides["CLAUDE_CONFIG_DIR"]
+    pinned = os.environ.get("CLAUDE_CONFIG_DIR")
+    if pinned:
+        return pinned
+    from providers.kernel_sandbox import protected_home
+    return os.path.join(protected_home(), ".claude")
+
+
+def consult_settings_files(account_profile="default", account_home=None, workdir=None):
+    """The four claude settings files. Consult's project root is the process cwd."""
+    from providers.admission import claude_settings_files
+    if workdir is None:
+        workdir = os.getcwd()
+    return claude_settings_files(
+        claude_config_home(account_profile, account_home), workdir)
+
+
 # Env selectors that enable plugins (and their hooks) independently of
 # --setting-sources; a read-only child never inherits them.
 READ_ONLY_SCRUBBED_ENV = ("CLAUDE_CODE_PLUGIN_DIRS",)
@@ -190,7 +216,10 @@ async def _run_claude_once(prompt, model, timeout_s, account_profile="default",
                     "detail": "claude exceeded %ss" % timeout_s}
 
         out = (res.get("stdout") or "").strip()
-        err = (res.get("stderr") or "").strip()
+        # The sign-in expiry notice is advice, not a failure: it must neither
+        # type the call as auth_error nor stand in as the failure's detail.
+        err = strip_signin_expiry_warning((res.get("stderr") or "").strip())
+        res = dict(res, stderr=err)
         rc = res.get("returncode")
 
         process_error = provider_accounts.process_failure(res, "claude")
@@ -254,7 +283,8 @@ async def _run_claude_once(prompt, model, timeout_s, account_profile="default",
 
 @local_request_before_spawn()
 async def run_claude_subprocess(prompt, model, timeout_s, account_profile="default",
-                              effort=None, scrub_siblings=False, account_pinned=False):
+                              effort=None, scrub_siblings=False, account_pinned=False,
+                              apply_aliases=False):
     selection = provider_accounts.AccountSelection(
         account_profile, "claude/" + str(model),
         timeout_s, provider="claude", resume=account_pinned)
@@ -262,12 +292,27 @@ async def run_claude_subprocess(prompt, model, timeout_s, account_profile="defau
         return selection.exhausted()
     isolated = selection.managed or provider_accounts.ring_pinned(
         "claude", account_profile, account_pinned)
+    from providers import admission
+    holder = admission.install_ring_skip(selection, lambda account: admission.consider(
+        "claude", account.get("account_profile"), model, effort, isolated=isolated,
+        host_env=os.environ,
+        settings_files=consult_settings_files(
+            account.get("account_profile"), account.get("account_home")),
+        apply_aliases=apply_aliases))
+
     async def attempt(account, remaining, managed):
-        return await _run_claude_once(
-            prompt, model, remaining, account["account_profile"], effort=effort,
+        decision = account.get("_admission")
+        run_model, run_effort, _catalog = admission.bound_call(model, effort, decision)
+        result = await _run_claude_once(
+            prompt, run_model, remaining, account["account_profile"], effort=run_effort,
             scrub_siblings=scrub_siblings or isolated,
             account_home=account["account_home"] if managed or isolated else None,
             account_home_explicit=account.get("account_home_explicit", True),
             account_auth_isolated=isolated, account_deadline=selection.deadline,
             pre_spawn=(lambda: selection.late_api_refusal(account)) if managed else None)
-    return await provider_accounts.run_selected(selection, attempt)
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort("claude", decision, effort))
+
+    result = await provider_accounts.run_selected(selection, attempt)
+    replaced = admission.ring_exhausted("claude", result, holder)
+    return replaced if replaced is not None else result

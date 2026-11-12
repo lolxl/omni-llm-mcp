@@ -16,7 +16,9 @@ Output modes (gen / big):
   default      envelope JSON on stdout
   --out FILE   reply text is written to FILE; the envelope's `text` is replaced
                by `text_path` + `text_bytes` (keeps stdout small for callers
-               that only want the verdict — the fan-out / agent-lane pattern)
+               that only want the verdict — the fan-out / agent-lane pattern).
+               For agent, the file is also written on a failed run that has
+               report text (the envelope stays ok: false, exit code 1).
   --out-mode   ref|auto — opt-in artifact spill (NEW flag; never overloads --out).
                ref: any non-empty success text becomes preview + artifact_ref;
                auto: spill only when UTF-8 text > 65536 bytes. Default = inline.
@@ -93,9 +95,14 @@ def _call_agent(**kwargs):
                 "detail": exception_detail(e)}
 
 
-def _emit(envelope, out=None, plain=False):
-    """Apply the output mode and return the process exit code."""
-    if out and envelope.get("ok") and isinstance(envelope.get("text"), str):
+def _emit(envelope, out=None, plain=False, out_on_failure=False):
+    """Apply the output mode and return the process exit code.
+
+    ``out_on_failure`` (agent only): also write --out when the envelope is not
+    ok but carries report text; the envelope itself stays a failure.
+    """
+    if (out and (envelope.get("ok") or out_on_failure)
+            and isinstance(envelope.get("text"), str)):
         # Known credential values never reach the file, even the answer's.
         text = known_secrets.mask_known(envelope["text"])
         with open(out, "w", encoding="utf-8") as f:
@@ -110,6 +117,9 @@ def _emit(envelope, out=None, plain=False):
         if envelope.get("ok"):
             text = envelope.get("text", "")
             sys.stdout.write(text if text.endswith("\n") or not text else text + "\n")
+            note = envelope.get("effort_note")
+            if isinstance(note, str) and note:
+                sys.stderr.write(note if note.endswith("\n") else note + "\n")
         else:
             sys.stderr.write(json.dumps(envelope, ensure_ascii=False) + "\n")
     else:
@@ -187,6 +197,9 @@ def build_parser():
 
     sub.add_parser("contract", help="print the interfaces this omni offers as one JSON "
                                     "object (version, subcommands, MCP tools, dispatch-exec)")
+
+    sub.add_parser("mcp", help="run the MCP stdio server (JSON-RPC on stdin/stdout; "
+                               "register it in an MCP client as command `omni`, args `mcp`)")
 
     sub.add_parser("session", help="local session table and peer routing")
 
@@ -282,26 +295,40 @@ def build_parser():
         command.add_argument("--json", action="store_true",
                              help="emit the stable JSON result")
 
-    status_cmd = model_ops.add_parser("status", help="show local catalog freshness and source")
+    status_cmd = model_ops.add_parser("status", help="show v2 catalog freshness")
     _catalog_args(status_cmd)
     status_cmd.add_argument("--details", action="store_true",
-                            help="include the normalized model rows from local catalogs")
+                            help="list model ids and names from the v2 record")
 
     refresh_cmd = model_ops.add_parser("refresh", help="refresh local metadata through fenced CLI adapters")
     _catalog_args(refresh_cmd)
     refresh_cmd.add_argument("--timeout", type=int, default=120,
                              help="per-provider deadline in seconds (default 120)")
 
-    check_cmd = model_ops.add_parser("check", help="compare local last-good catalogs with bundled data")
+    check_cmd = model_ops.add_parser("check", help="admit the shipped defaults against the v2 record")
     _catalog_args(check_cmd)
 
-    import_cmd = model_ops.add_parser("import", help="import a normalized manual catalog")
-    _catalog_args(import_cmd, provider_required=True, profile_required=True)
-    import_cmd.add_argument("--file", required=True, dest="catalog_file")
+    admit_cmd = model_ops.add_parser(
+        "admit", help="admit one model and effort against the v2 record")
+    admit_cmd.add_argument("--provider", required=True,
+                           choices=("cursor", "agy", "codex", "claude", "grok"))
+    admit_cmd.add_argument("--model", required=True)
+    admit_cmd.add_argument("--effort", default=None)
+    admit_cmd.add_argument("--profile", default="default",
+                           help="provider account profile (default: default)")
+    admit_cmd.add_argument("--json", action="store_true",
+                           help="emit the stable JSON result")
 
-    snapshot_cmd = model_ops.add_parser("snapshot", help="export validated catalogs for manual review")
-    _catalog_args(snapshot_cmd)
-    snapshot_cmd.add_argument("--output", required=True)
+    alias_cmd = model_ops.add_parser(
+        "alias", help="show or edit the user alias file (catalog dispatch only)")
+    alias_ops = alias_cmd.add_subparsers(dest="alias_cmd", required=True)
+    alias_ops.add_parser("show", help="print each key, its effective value, and its origin")
+    alias_set = alias_ops.add_parser(
+        "set", help="set one key; a record refusal warns and still writes")
+    alias_set.add_argument("key")
+    alias_set.add_argument("value")
+    alias_unset = alias_ops.add_parser("unset", help="remove one key from the alias file")
+    alias_unset.add_argument("key")
 
     schedule_cmd = model_ops.add_parser("schedule", help="print a launchd catalog refresh plist")
     schedule_cmd.add_argument("--print", action="store_true", required=True,
@@ -1237,6 +1264,66 @@ def _main_artifact(ns):
     return 0 if value.get("ok") else 1
 
 
+def _main_alias(ns):
+    """``omni models alias show|set|unset``. Writes refuse at OMNI_LLM_DEPTH >= 1."""
+    from providers import aliases
+    from providers.config import env_depth
+    command = ns.alias_cmd
+    if command in ("set", "unset") and env_depth() >= 1:
+        return _emit({
+            "ok": False,
+            "reason": "recursion_guard",
+            "detail": "omni models alias %s refused at OMNI_LLM_DEPTH=%d" % (
+                command, env_depth()),
+        })
+    try:
+        if command == "show":
+            return _emit({"ok": True, "aliases": aliases.show()})
+        if command == "set":
+            warning = aliases.admission_warning(ns.key, ns.value)
+            aliases.set_alias(ns.key, ns.value)
+            payload = {"ok": True, "key": ns.key, "value": ns.value}
+            if warning:
+                payload["warning"] = warning
+                sys.stderr.write(warning if warning.endswith("\n") else warning + "\n")
+            return _emit(payload)
+        if command == "unset":
+            aliases.unset_alias(ns.key)
+            return _emit({"ok": True, "key": ns.key, "unset": True})
+        return _emit({"ok": False, "reason": "unknown_command",
+                      "detail": "alias unknown_command"})
+    except aliases.AliasError as exc:
+        return _emit({"ok": False, "reason": "alias_file", "detail": exc.detail})
+
+
+def _format_models_admit(value):
+    """One line for ``omni models admit`` without ``--json``."""
+    def show(item):
+        if item is None:
+            return "-"
+        if isinstance(item, bool):
+            return "true" if item else "false"
+        if isinstance(item, list):
+            return ",".join(str(part) for part in item) or "-"
+        return str(item)
+
+    return (
+        "ok=%s admitted=%s provider=%s profile=%s model=%s effort=%s "
+        "effort_source=%s refusal=%s warnings=%s\n"
+        % (
+            show(value.get("ok")),
+            show(value.get("admitted")),
+            show(value.get("provider")),
+            show(value.get("profile")),
+            show(value.get("model")),
+            show(value.get("effort")),
+            show(value.get("effort_source")),
+            show(value.get("refusal")),
+            show(value.get("warnings")),
+        )
+    )
+
+
 def _main_model_catalog(ns):
     from providers import model_catalog
 
@@ -1249,18 +1336,26 @@ def _main_model_catalog(ns):
             value = model_catalog.refresh(ns.provider, ns.profile, ns.timeout)
         elif command == "check":
             value = model_catalog.check(ns.provider, ns.profile)
-        elif command == "import":
-            value = model_catalog.manual_import(
-                ns.provider, ns.profile, ns.catalog_file)
-        elif command == "snapshot":
-            value = model_catalog.snapshot(
-                ns.output, ns.provider, ns.profile)
+        elif command == "admit":
+            value = model_catalog.admit(
+                ns.provider, ns.model, effort=getattr(ns, "effort", None),
+                profile=getattr(ns, "profile", None))
         elif command == "schedule":
             value = model_catalog.schedule_plist(
                 ns.profile, ns.interval, ns.timeout, provider=ns.provider)
         else:
             value = {"ok": False, "reason": "unknown_command",
                      "detail": "model catalog unknown_command"}
+    except model_catalog.CatalogError as exc:
+        # A profile name that fails the name rule is argv usage, ordered exit 2.
+        # Other catalog failures stay a runtime error, as before.
+        if command == "admit" and exc.reason == "unsupported_profile":
+            value = {"ok": False, "reason": "usage_error",
+                     "detail": "model catalog unsupported_profile",
+                     "exit_code": 2}
+        else:
+            value = {"ok": False, "reason": "runtime_error",
+                     "detail": "model catalog runtime_error"}
     except Exception as exc:
         value = {"ok": False, "reason": "runtime_error",
                  "detail": "model catalog runtime_error"}
@@ -1268,8 +1363,15 @@ def _main_model_catalog(ns):
     if command == "schedule" and value.get("ok"):
         sys.stdout.write(value["plist"])
         return 0
+    if command == "admit" and isinstance(value, dict) and "admitted" in value:
+        payload = mask_envelope(value)
+        if getattr(ns, "json", False):
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        else:
+            sys.stdout.write(_format_models_admit(payload))
+        return 0 if payload.get("admitted") else 1
     sys.stdout.write(json.dumps(mask_envelope(value), ensure_ascii=False) + "\n")
-    if command == "check" and isinstance(value.get("exit_code"), int):
+    if command in ("check", "admit") and isinstance(value.get("exit_code"), int):
         return value["exit_code"]
     if command == "refresh" and not value.get("ok"):
         return 2
@@ -1346,6 +1448,13 @@ def main(argv=None):
         return _main_agent_job(argv[1:])
     parser = build_parser()
     ns = parser.parse_args(argv)
+    if ns.cmd == "mcp":
+        # Raw stdio server: no JSON envelope, no extra event loop. main() owns
+        # its own asyncio.run and stdout carries JSON-RPC only. prime() above
+        # already ran; the server's own prime() is an idempotent re-register.
+        from providers.mcp_server import main as mcp_main
+        mcp_main()
+        return 0
     if ns.cmd == "contract":
         from providers.contract import build_contract
         sys.stdout.write(json.dumps(build_contract(parser), indent=2, sort_keys=True) + "\n")
@@ -1379,10 +1488,12 @@ def main(argv=None):
                                  account_profile=ns.profile,
                                  allow_main=ns.allow_main,
                                  **agent_kwargs),
-                     out=ns.out, plain=ns.plain)
+                     out=ns.out, plain=ns.plain, out_on_failure=True)
     if ns.cmd == "img":
         return _emit(_call("llm_image", _args_img(ns)))
     if ns.cmd == "models":
+        if getattr(ns, "model_catalog_cmd", None) == "alias":
+            return _main_alias(ns)
         if getattr(ns, "model_catalog_cmd", None):
             return _main_model_catalog(ns)
         return _emit(_call("list_models", {"timeout_s": ns.timeout}))

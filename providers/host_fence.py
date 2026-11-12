@@ -768,6 +768,18 @@ def protected_record_dir():
     return os.path.join(state, _RECORD_SUBDIR)
 
 
+def alias_file_denies():
+    """Final deny-write rows for ``aliases.json``.
+
+    The same lexical, resolved, and plain spellings as a record row. No
+    fenced profile is exempt.
+    """
+    from providers.aliases import alias_path
+    path = alias_path()
+    return tuple(dict.fromkeys(
+        _with_plain_spelling(kernel_sandbox._deny_entries("literal", path))))
+
+
 def record_dir_denies():
     """Final deny-write rows for the record dir and every ancestor of it.
 
@@ -1994,10 +2006,11 @@ def prepare_host_fence(argv, *, provider, workdir, read_only=False, env=None,
     # child's reach in EVERY fenced profile: git workdir or not, read-only or not.
     try:
         record_rows = record_dir_denies()
+        alias_rows = alias_file_denies()
     except ProtectedListError as exc:
         _refuse("fence_path_rejected", exc.detail)
     wrap_kw["extra_deny_write_final"] = (
-        tuple(wrap_kw.get("extra_deny_write_final") or ()) + record_rows
+        tuple(wrap_kw.get("extra_deny_write_final") or ()) + record_rows + alias_rows
     )
     if repo_meta:
         wrap_kw["extra_deny_exec"] = (

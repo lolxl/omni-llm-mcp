@@ -26,6 +26,30 @@ from providers import cursor as cursor_mod  # noqa: E402
 from providers import grok as grok_mod  # noqa: E402
 from providers.profiles import spawn_env  # noqa: E402
 from tests.test_agent import FakeRunCli, depth, patched_lane  # noqa: E402
+from tests import offline_home  # noqa: E402
+
+_HOME = None
+_STATE_PATCH = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module. It goes
+    # first (and closes last): that helper scrubs the import-time state-dir pin.
+    global _HOME, _STATE_PATCH
+    _HOME = offline_home.use_synthetic_home()
+    _STATE_PATCH = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": _TMP})
+    _STATE_PATCH.start()
+
+
+def tearDownModule():
+    try:
+        _STATE_PATCH.stop()
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
 
 _REAL_WHICH = shutil.which
 _SINK = "/bin/echo"
@@ -40,6 +64,10 @@ def _fake_which(name, *a, **kw):
 
 
 class TestNotifyEnv(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _assert_stripped(self, env):
         self.assertNotIn("OMNI_LLM_NOTIFY_CMD", env)
         self.assertEqual(env.get("OMNI_LLM_NOTIFY_QUIET"), "1")

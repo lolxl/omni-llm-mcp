@@ -5,11 +5,32 @@ Consult and agent-lane call sites peel the token BEFORE ``resolve_route``,
 so routing always sees the bare name. Cursor consumes the same helper
 inside ``resolve_model`` so its argv / envelope stay identical.
 """
+import re
+
 from providers.config import EFFORT_LEVELS
 
+# The retired ``agy-opus-<version>`` form. Callers pass ``agy/<id>``.
+_AGY_OPUS_FORM = re.compile(r"agy-opus-", re.IGNORECASE)
 
-def is_agy_opus_alias(name):
-    return str(name).strip().lower().startswith("agy-opus-")
+
+def retired_agy_opus(name):
+    """Whether one seat name is the retired ``agy-opus-<version>`` form.
+
+    A trailing ``@<token>`` is ignored. This does not validate the token.
+    """
+    raw = "" if name is None else str(name).strip()
+    if "@" in raw:
+        raw = raw.rsplit("@", 1)[0].strip()
+    return bool(_AGY_OPUS_FORM.match(raw))
+
+
+def retired_model_error():
+    """LOUD refusal for the retired form. The detail names ``agy/<id>``."""
+    return {
+        "ok": False,
+        "reason": "unsupported_model",
+        "detail": "pass the catalog id as agy/<id>",
+    }
 
 
 def split_effort(name):
@@ -25,8 +46,6 @@ def split_effort(name):
         return raw, None, None
     bare, suffix = raw.rsplit("@", 1)
     token = suffix.strip().lower()
-    if token == "med" and is_agy_opus_alias(bare):
-        token = "medium"
     if not bare.strip() or not token or token not in EFFORT_LEVELS:
         return None, None, {
             "ok": False,
@@ -45,7 +64,13 @@ def take_effort(name, effort):
     Both spellings present (including identical values) is LOUD
     ``unsupported_effort``. Blank ``effort=`` is omitted, matching
     ``normalize_effort``. Returns ``(bare_name, effort_or_None, error)``.
+    A name in the retired ``agy-opus-<version>`` form is
+    ``unsupported_model`` and names ``agy/<id>``. That check runs before
+    effort validation, so an illegal token or a second ``effort=`` on a
+    retired name is still ``unsupported_model``.
     """
+    if retired_agy_opus(name):
+        return None, None, retired_model_error()
     bare, token, err = split_effort(name)
     if err:
         return None, None, err
@@ -61,11 +86,4 @@ def take_effort(name, effort):
             ),
         }
     merged = token if token is not None else effort
-    if is_agy_opus_alias(bare):
-        from providers.model_catalog import agy_opus_alias_model
-        normalized = str(merged or "").strip().lower()
-        if normalized == "med":
-            normalized = "medium"
-        canonical, err = agy_opus_alias_model(bare, normalized)
-        return (None, None, err) if err else (canonical, normalized, None)
     return bare, merged, None

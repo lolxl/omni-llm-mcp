@@ -11,12 +11,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 from providers import host_fence as h
+from tests import offline_home
 
 _STATE_PATCH = None
 _STATE_DIR = None
+_HOME = None
 
 
 def setUpModule():
+    # #223: run directly, the fence tests below admit ~/.claude.json and the
+    # login keychain by their real names; point protected_home() at a synthetic
+    # home so a CLI session rewriting them cannot flip a test.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
     # #168: a write-mode run records a repository's protected branches under the
     # state dir. Keep these fixtures' repositories out of the real one.
     global _STATE_PATCH, _STATE_DIR
@@ -29,11 +36,17 @@ def tearDownModule():
     import shutil
     _STATE_PATCH.stop()
     shutil.rmtree(_STATE_DIR, ignore_errors=True)
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 
 class HostFenceTests(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.stack = __import__('contextlib').ExitStack()
@@ -49,6 +62,26 @@ class HostFenceTests(unittest.TestCase):
 
     def prepare(self, **kw):
         return h.prepare_host_fence(['/fake/grok', '--sandbox', 'strict', '-p', 'fixture'], provider='grok', workdir=self.tmp.name, env={}, **kw)
+
+    def test_alias_file_rows_cover_lexical_resolved_and_plain(self):
+        state = os.path.join(self.tmp.name, 'state')
+        os.makedirs(state)
+        firm = '/System/Volumes/Data' + os.path.realpath(state)
+        chosen = state
+        try:
+            if os.path.samestat(os.stat(firm), os.stat(state)):
+                chosen = firm
+        except OSError:
+            pass
+        with mock.patch.dict(os.environ, {'OMNI_LLM_STATE_DIR': chosen}):
+            self.prepare()
+            rows = self.wrap.call_args.kwargs.get('extra_deny_write_final') or ()
+            lexical = os.path.abspath(os.path.join(chosen, 'aliases.json'))
+            resolved = os.path.realpath(lexical)
+            plain = h._plain_spelling(lexical)
+            for spelling in (lexical, resolved, plain):
+                if spelling:
+                    self.assertIn(('literal', spelling), rows)
 
     def test_read_only_reaches_policy_verification_and_application(self):
         argv, env, meta = self.prepare(read_only=True)
@@ -560,6 +593,10 @@ class DirectConsumerBoundaryTests(unittest.TestCase):
     'requires the live macOS Seatbelt host fence',
 )
 class RepoWriteFenceLiveTests(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_opt_in_can_write_linked_repo_and_git_metadata_only(self):
         with tempfile.TemporaryDirectory(prefix='omni_repo_write_', dir='/private/tmp') as raw:
             root = Path(raw)
@@ -783,6 +820,10 @@ print(json.dumps(out))
     'requires the live macOS Seatbelt host fence',
 )
 class GrokInstructionFenceLiveTests(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_global_instructions_are_unreadable_but_grok_config_is_not(self):
         with tempfile.TemporaryDirectory(prefix='omni_grok_home_', dir='/private/tmp') as grok_home, \
                 tempfile.TemporaryDirectory(prefix='omni_grok_outside_', dir='/private/tmp') as outside, \
@@ -830,6 +871,8 @@ class GrokInstructionFenceReviewTests(unittest.TestCase):
     """Review findings F6-F9 against the real Seatbelt wrap."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.stack = __import__('contextlib').ExitStack()
         self.addCleanup(self.stack.close)
         mk = lambda prefix: os.path.realpath(self.stack.enter_context(
@@ -925,6 +968,8 @@ class ApiSettingsExposureTests(unittest.TestCase):
     """The pure containment judgement over a composed write set."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='omni_apiset_x_'))
         self.addCleanup(shutil.rmtree, self.root, True)
         self.base = os.path.join(self.root, 'a', 'b', 'api-settings')
@@ -1006,6 +1051,8 @@ class _SettingsFenceFixture(unittest.TestCase):
     configure_api = False
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmpdir = os.environ.get('TMPDIR') or '/private/tmp'
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='omni_apiset_', dir='/private/var/tmp'))
         self.addCleanup(shutil.rmtree, self.root, True)
@@ -1065,6 +1112,37 @@ class NoApiAccountsFenceTests(_SettingsFenceFixture):
         for base in (self.state_base, self.home_base):
             self.assertNotIn(('subpath', os.path.realpath(base)), rows)
             self.assertNotIn(('subpath', base), rows)
+
+    def test_fenced_child_cannot_write_aliases_json(self):
+        import shlex
+        state = os.path.join(self.work, 'alias-state')
+        os.makedirs(state)
+        firm = '/System/Volumes/Data' + os.path.realpath(state)
+        chosen = state
+        try:
+            if os.path.samestat(os.stat(firm), os.stat(state)):
+                chosen = firm
+        except OSError:
+            pass
+        os.environ['OMNI_LLM_STATE_DIR'] = chosen
+        target = os.path.join(os.path.realpath(state), 'aliases.json')
+        with open(target, 'w', encoding='utf-8') as handle:
+            handle.write('keep\n')
+        lexical = os.path.abspath(os.path.join(chosen, 'aliases.json'))
+        resolved = os.path.realpath(lexical)
+        plain = h._plain_spelling(lexical)
+        spellings = []
+        for spelling in (lexical, resolved, plain):
+            if spelling and spelling not in spellings:
+                spellings.append(spelling)
+        rows = h.alias_file_denies()
+        for spelling in spellings:
+            self.assertIn(('literal', spelling), rows)
+        script = '; '.join('printf x > %s' % shlex.quote(spelling) for spelling in spellings)
+        probe = self.run_fenced(script, workdir=self.work)
+        self.assertNotEqual(probe.returncode, 0, probe.stderr)
+        with open(target, encoding='utf-8') as handle:
+            self.assertEqual(handle.read(), 'keep\n')
 
     def test_final_deny_rows_present_for_any_provider_without_api_env(self):
         self.assertNotIn('OMNI_LLM_API_PROFILES_CLAUDE', os.environ)

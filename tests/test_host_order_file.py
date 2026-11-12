@@ -11,10 +11,28 @@ from contextlib import ExitStack
 from unittest import mock
 
 from providers import host_fence as h, kernel_sandbox as k
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 class OrderFileAdmissionTests(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = os.path.realpath(self.tmp.name)
@@ -150,6 +168,10 @@ else:
 
 @unittest.skipUnless(k.available(), "macOS Seatbelt required")
 class OrderFileHostTests(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_cli_named_home_order_only_and_tmp_order_remains_unwritable(self):
         with ExitStack() as stack:
             home_fixture = stack.enter_context(tempfile.TemporaryDirectory(

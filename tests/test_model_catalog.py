@@ -79,30 +79,40 @@ class ModelCatalogTests(unittest.TestCase):
             stream.write("\n")
         return path
 
-    def manual_payload(self, provider, model_id, *, observed_at=None, efforts=None):
-        value = {"provider": provider, "models": [{
-            "id": model_id,
-            "name": model_id,
-            "supported_efforts": list(efforts or []),
-        }]}
-        if observed_at is not None:
-            value["observed_at"] = observed_at
-        return value
+    def live_record(self, provider, model_id, *, observed_at="2026-10-16T00:00:00Z"):
+        return {
+            "provider": provider,
+            "source": "live",
+            "observed_at": observed_at,
+            "availability": "provider_advertised",
+            "models": [{
+                "id": model_id,
+                "name": model_id,
+                "routable_id": "%s/%s" % (provider, model_id),
+                "supported_efforts": [],
+            }],
+        }
+
+    def save_v2(self, provider, profile, model_id, **kwargs):
+        from providers import catalog_v2
+        catalog_v2.save(provider, profile, self.live_record(provider, model_id, **kwargs))
+        return catalog_v2._paths(provider, profile)[0]
 
     def test_sanitized_captures_parse_for_all_five_providers(self):
+        from providers import catalog_record
         cursor = model_catalog.parse_cursor_output(
             (FIXTURES / "model_catalog_cursor_models.txt").read_text(encoding="utf-8"),
             observed_at="2026-10-16T01:51:28.408634Z", cli_version="2026.10.01-e373342")
         agy = model_catalog.parse_agy_output(
             (FIXTURES / "model_catalog_agy_models.tsv").read_text(encoding="utf-8"),
             observed_at="2026-10-16T01:51:29.564387Z", cli_version="1.3.3")
-        codex = model_catalog.parse_codex_result(json.loads(
+        codex = catalog_record.parse_codex_result(json.loads(
             (FIXTURES / "model_catalog_codex_model_list.json").read_text(encoding="utf-8")),
             observed_at="2026-10-16T02:12:36.020149Z", cli_version="0.162.1")
-        claude = model_catalog.parse_claude_models(json.loads(
+        claude = catalog_record.parse_claude_models(json.loads(
             (FIXTURES / "model_catalog_claude_initialize.json").read_text(encoding="utf-8"))["models"],
             observed_at="2026-10-16T02:06:25.779546Z", cli_version="2.1.301")
-        grok = model_catalog.parse_grok_output(
+        grok = catalog_record.parse_grok_output(
             (FIXTURES / "model_catalog_grok_models.txt").read_text(encoding="utf-8"),
             observed_at="2026-10-16T02:06:26.123907Z", cli_version="1.0.52")
 
@@ -114,31 +124,8 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(codex["models"][0]["default_effort"], "low")
         self.assertIn("gpt-oss-120b-medium", {row["id"] for row in agy["models"]})
 
-    def test_unauthenticated_grok_listing_fails_without_replacing_last_good(self):
-        unauthenticated = (FIXTURES / "model_catalog_grok_unauthenticated.txt").read_text(
-            encoding="utf-8")
-        with self.assertRaises(model_catalog.CatalogError) as caught:
-            model_catalog.parse_grok_output(unauthenticated)
-        self.assertEqual(caught.exception.reason, "auth_error")
-
-        manual = self.write_json("grok-last-good.json", self.manual_payload(
-            "grok", "grok-last-good", observed_at="2026-10-01T00:00:00Z"))
-        self.assertTrue(model_catalog.manual_import("grok", "default", manual)["ok"])
-        cache_path = model_catalog._cache_paths("grok", "default")[0]
-        before = cache_path.read_bytes()
-
-        def unauthenticated_discovery(_profile, _timeout):
-            return model_catalog.parse_grok_output(unauthenticated)
-
-        with mock.patch.dict(model_catalog._DISCOVERERS,
-                             {"grok": unauthenticated_discovery}), \
-                mock.patch.object(model_catalog, "_best_effort_cli_version", return_value=None):
-            result = model_catalog.refresh("grok", "default", 5)
-        self.assertEqual(result["providers"]["grok"]["reason"], "auth_error")
-        self.assertEqual(cache_path.read_bytes(), before)
-
     def test_refresh_all_returns_every_road_when_profiles_and_cache_fail(self):
-        bundle = model_catalog.bundled_catalog()
+        codex_record = self.live_record("codex", "codex-one")
         home = Path(self.work) / ".codex-work"
         home.mkdir()
 
@@ -150,7 +137,7 @@ class ModelCatalogTests(unittest.TestCase):
         discoverers = {}
         for name in model_catalog.PROVIDERS:
             if name == "codex":
-                discoverers[name] = lambda _profile, _timeout: bundle["codex"]
+                discoverers[name] = lambda _profile, _timeout: codex_record
             else:
                 discoverers[name] = lambda _profile, _timeout, road=name: (_ for _ in ()).throw(
                     model_catalog.CatalogError("unsupported_profile", road))
@@ -190,8 +177,9 @@ class ModelCatalogTests(unittest.TestCase):
                 def prepare(argv, **kwargs):
                     return list(argv), kwargs.get("env", child_env), metadata
 
-                with mock.patch.object(model_catalog, "_catalog_child_environment",
-                                       return_value=identity_result), \
+                with mock.patch("platform.system", return_value="Darwin"), \
+                        mock.patch.object(model_catalog, "_catalog_child_environment",
+                                          return_value=identity_result), \
                         mock.patch("providers.host_fence.prepare_host_fence",
                                    side_effect=prepare), \
                         mock.patch.object(model_catalog, "_run_bounded") as bounded:
@@ -201,8 +189,9 @@ class ModelCatalogTests(unittest.TestCase):
                     self.assertEqual(caught.exception.reason, "discovery_unavailable")
                     bounded.assert_not_called()
 
-                with mock.patch("providers.host_fence.prepare_host_fence",
-                                side_effect=prepare), \
+                with mock.patch("platform.system", return_value="Darwin"), \
+                        mock.patch("providers.host_fence.prepare_host_fence",
+                                   side_effect=prepare), \
                         mock.patch.object(model_catalog.subprocess, "Popen") as popen:
                     with self.assertRaises(model_catalog.CatalogError) as caught:
                         model_catalog._query_codex_models(
@@ -211,8 +200,9 @@ class ModelCatalogTests(unittest.TestCase):
                     self.assertEqual(caught.exception.reason, "discovery_unavailable")
                     popen.assert_not_called()
 
-                with mock.patch.object(model_catalog, "_catalog_child_environment",
-                                       return_value=identity_result), \
+                with mock.patch("platform.system", return_value="Darwin"), \
+                        mock.patch.object(model_catalog, "_catalog_child_environment",
+                                          return_value=identity_result), \
                         mock.patch("providers.kernel_sandbox.resolve_agent_binary",
                                    return_value="/usr/bin/claude"), \
                         mock.patch("providers.host_fence.prepare_host_fence",
@@ -223,12 +213,8 @@ class ModelCatalogTests(unittest.TestCase):
                     self.assertEqual(caught.exception.reason, "discovery_unavailable")
                     popen.assert_not_called()
 
-    def test_unverified_metadata_fence_preserves_cache_and_manual_import_works(self):
-        initial = self.write_json("cursor-fenced-last-good.json", self.manual_payload(
-            "cursor", "cursor-fenced-last-good"))
-        self.assertTrue(model_catalog.manual_import(
-            "cursor", "default", initial)["ok"])
-        cache_path = model_catalog._cache_paths("cursor", "default")[0]
+    def test_unverified_metadata_fence_does_not_replace_the_v2_record(self):
+        cache_path = self.save_v2("cursor", "default", "cursor-fenced-last-good")
         last_good = cache_path.read_bytes()
         cursor_home = Path(self.work) / "cursor-config"
         cursor_home.mkdir()
@@ -236,10 +222,11 @@ class ModelCatalogTests(unittest.TestCase):
         def prepare(argv, *, env, **_kwargs):
             return list(argv), env, {"fence": "none"}
 
-        with mock.patch.object(model_catalog, "_catalog_child_environment",
-                               return_value=({}, {"PATH": "/usr/bin",
-                                                 "CURSOR_CONFIG_DIR": str(cursor_home)},
-                                             {}, str(cursor_home), {})), \
+        with mock.patch("platform.system", return_value="Darwin"), \
+                mock.patch.object(model_catalog, "_catalog_child_environment",
+                                  return_value=({}, {"PATH": "/usr/bin",
+                                                    "CURSOR_CONFIG_DIR": str(cursor_home)},
+                                                {}, str(cursor_home), {})), \
                 mock.patch("providers.cursor.resolve_bin",
                            return_value="/usr/bin/cursor-agent"), \
                 mock.patch("providers.cursor.resolve_config_dir",
@@ -256,13 +243,6 @@ class ModelCatalogTests(unittest.TestCase):
         bounded.assert_not_called()
         self.assertEqual(cache_path.read_bytes(), last_good)
 
-        manual = self.write_json("cursor-manual-after-fence-refusal.json",
-                                 self.manual_payload("cursor", "cursor-manual-after-refusal"))
-        imported = model_catalog.manual_import("cursor", "default", manual)
-        self.assertTrue(imported["ok"], imported)
-        cached, _info = model_catalog._load_cached("cursor", "default")
-        self.assertEqual(cached["models"][0]["id"], "cursor-manual-after-refusal")
-
     def test_cursor_metadata_child_keeps_vendor_config_env_after_allowlist(self):
         from providers.host_fence import allowlisted_child_env
         config_home = Path(self.work) / "cursor-home"
@@ -277,8 +257,9 @@ class ModelCatalogTests(unittest.TestCase):
             captured.update(argv=argv, env=env)
             return b"cursor metadata\n"
 
-        with mock.patch.dict(os.environ, {
-                "OMNI_LLM_CURSOR_CONFIG_DIR_WORK": str(config_home)}), \
+        with mock.patch("platform.system", return_value="Darwin"), \
+                mock.patch.dict(os.environ, {
+                    "OMNI_LLM_CURSOR_CONFIG_DIR_WORK": str(config_home)}), \
                 mock.patch("providers.host_fence.prepare_host_fence", side_effect=fenced), \
                 mock.patch.object(model_catalog, "_run_bounded", side_effect=bounded):
             output = model_catalog._spawn_one_shot(
@@ -295,8 +276,6 @@ class ModelCatalogTests(unittest.TestCase):
         named_home_two = Path(self.work) / "cursor-work-two"
         for path in (global_home, named_home_one, named_home_two):
             path.mkdir()
-        payload = self.write_json("cursor-work-catalog.json", self.manual_payload(
-            "cursor", "named-work-only"))
         captured = {}
 
         def fenced(argv, *, env, **_kwargs):
@@ -310,19 +289,18 @@ class ModelCatalogTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
                 "CURSOR_CONFIG_DIR": str(global_home),
                 "OMNI_LLM_CURSOR_CONFIG_DIR_WORK": str(named_home_one)}):
-            imported = model_catalog.manual_import("cursor", "work", payload)
-            first_path = model_catalog._cache_paths("cursor", "work")[0]
+            first_path = self.save_v2("cursor", "work", "named-work-only")
             first_status = model_catalog.status("cursor", "work", details=True)
-            self.assertTrue(imported["ok"], imported)
-            self.assertEqual(first_status["catalogs"][0]["origin"], "local")
             self.assertEqual(first_status["catalogs"][0]["models"][0]["id"],
                              "named-work-only")
 
             os.environ["OMNI_LLM_CURSOR_CONFIG_DIR_WORK"] = str(named_home_two)
-            second_path = model_catalog._cache_paths("cursor", "work")[0]
+            from providers import catalog_v2
+            second_path = catalog_v2._paths("cursor", "work")[0]
             identity, _overrides = model_catalog._profile_identity_inputs("cursor", "work")
             second_status = model_catalog.status("cursor", "work", details=True)
-            with mock.patch("providers.host_fence.prepare_host_fence", side_effect=fenced), \
+            with mock.patch("platform.system", return_value="Darwin"), \
+                    mock.patch("providers.host_fence.prepare_host_fence", side_effect=fenced), \
                     mock.patch.object(model_catalog, "_run_bounded", side_effect=bounded):
                 output = model_catalog._spawn_one_shot(
                     "cursor", ["/usr/bin/cursor-agent", "--list-models"],
@@ -330,9 +308,8 @@ class ModelCatalogTests(unittest.TestCase):
 
         self.assertNotEqual(first_path, second_path)
         self.assertEqual(identity["config_home"], os.path.realpath(named_home_two))
-        self.assertEqual(second_status["catalogs"][0]["origin"], "bundled")
-        self.assertNotIn("named-work-only", {
-            row["id"] for row in second_status["catalogs"][0]["models"]})
+        self.assertEqual(second_status["catalogs"][0]["model_count"], 0)
+        self.assertEqual(second_status["catalogs"][0]["models"], [])
         self.assertEqual(output, "cursor metadata\n")
         self.assertEqual(captured["env"]["CURSOR_CONFIG_DIR"], str(named_home_two))
 
@@ -345,9 +322,6 @@ class ModelCatalogTests(unittest.TestCase):
         opt_in_two = Path(self.work) / "cursor-opt-in-two"
         for path in (vendor_home, opt_in_one, opt_in_two):
             path.mkdir()
-        payload = self.write_json("cursor-default-catalog.json", self.manual_payload(
-            "cursor", "default-opt-in-only"))
-
         def selected_child_home():
             overrides, error = resolve_profile("cursor", "default")
             self.assertIsNone(error)
@@ -358,27 +332,26 @@ class ModelCatalogTests(unittest.TestCase):
                 "CURSOR_CONFIG_DIR": str(vendor_home),
                 "OMNI_LLM_CURSOR_CONFIG_DIR": str(opt_in_one),
                 "OMNI_LLM_CURSOR_CONFIG_DIR_WORK": ""}):
-            imported = model_catalog.manual_import("cursor", "default", payload)
-            first_path = model_catalog._cache_paths("cursor", "default")[0]
+            first_path = self.save_v2("cursor", "default", "default-opt-in-only")
             first_identity, _ = model_catalog._profile_identity_inputs("cursor", "default")
             first_status = model_catalog.status("cursor", "default", details=True)
             first_child_home = selected_child_home()
             os.environ["OMNI_LLM_CURSOR_CONFIG_DIR"] = str(opt_in_two)
-            second_path = model_catalog._cache_paths("cursor", "default")[0]
+            from providers import catalog_v2
+            second_path = catalog_v2._paths("cursor", "default")[0]
             second_identity, _ = model_catalog._profile_identity_inputs("cursor", "default")
             second_status = model_catalog.status("cursor", "default", details=True)
             second_child_home = selected_child_home()
 
-        self.assertTrue(imported["ok"], imported)
         self.assertEqual(first_identity["config_home"], os.path.realpath(first_child_home))
         self.assertEqual(first_child_home, str(opt_in_one))
         self.assertNotEqual(first_path, second_path)
         self.assertEqual(second_identity["config_home"], os.path.realpath(second_child_home))
         self.assertEqual(second_child_home, str(opt_in_two))
-        self.assertEqual(first_status["catalogs"][0]["origin"], "local")
-        self.assertEqual(second_status["catalogs"][0]["origin"], "bundled")
-        self.assertNotIn("default-opt-in-only", {
-            row["id"] for row in second_status["catalogs"][0]["models"]})
+        self.assertEqual(first_status["catalogs"][0]["models"][0]["id"],
+                         "default-opt-in-only")
+        self.assertEqual(second_status["catalogs"][0]["model_count"], 0)
+        self.assertEqual(second_status["catalogs"][0]["models"], [])
 
     def test_cursor_api_key_only_profile_identity_matches_child_without_inherited_home(self):
         from providers.cursor import resolve_config_dir
@@ -404,13 +377,16 @@ class ModelCatalogTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": str(state)}):
             status = model_catalog.status("cursor", "default")
             checked = model_catalog.check("cursor", "default")
-            slug, error = config.cursor_effort_slug("grok-4.7", "high", "default")
+            slug, error = config.cursor_effort_slug("gpt-5.6-sol", "high", "default")
         self.assertTrue(status["ok"])
         row = status["catalogs"][0]
-        self.assertEqual(row["origin"], "bundled")
-        self.assertEqual(row["cache_diagnostic"], "cache_identity_unavailable")
-        self.assertEqual(checked["providers"][0]["reason"], "cache_identity_unavailable")
-        self.assertEqual((slug, error), ("grok-4.7-high", None))
+        self.assertIsNone(row["observed_at"])
+        self.assertIsNone(row["age_seconds"])
+        self.assertIsNone(row["stale"])
+        self.assertEqual(row["model_count"], 0)
+        self.assertEqual(checked["exit_code"], 2)
+        self.assertEqual(checked["providers"][0]["admission"][0]["refusal"], "no_catalog")
+        self.assertEqual((slug, error), ("gpt-5.6-sol-high", None))
         self.assertFalse(state.exists())
 
     def test_list_models_keeps_legacy_envelope_when_catalog_read_fails(self):
@@ -430,15 +406,16 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(result["catalogs"]["reason"], "cache_unavailable")
 
     def test_refresh_records_best_effort_cli_version_without_losing_listing(self):
-        record = dict(model_catalog.bundled_catalog()["codex"])
-        record.pop("cli_version", None)
+        from providers import catalog_v2
+        record = self.live_record("codex", "codex-one")
         with mock.patch.dict(model_catalog._DISCOVERERS,
                              {"codex": lambda _profile, _timeout: record}), \
                 mock.patch.object(model_catalog, "_best_effort_cli_version",
                                   return_value="9.8.7"):
             result = model_catalog.refresh("codex", "default", 5)
         self.assertTrue(result["providers"]["codex"]["ok"])
-        cached, _info = model_catalog._load_cached("codex", "default")
+        cached, reason = catalog_v2.load("codex", "default")
+        self.assertIsNone(reason)
         self.assertEqual(cached["cli_version"], "9.8.7")
 
         with mock.patch.dict(model_catalog._DISCOVERERS,
@@ -447,32 +424,10 @@ class ModelCatalogTests(unittest.TestCase):
                                   side_effect=model_catalog.CatalogError("timeout")):
             result = model_catalog.refresh("codex", "default", 5)
         self.assertTrue(result["providers"]["codex"]["ok"])
-        cached, _info = model_catalog._load_cached("codex", "default")
+        cached, reason = catalog_v2.load("codex", "default")
+        self.assertIsNone(reason)
         self.assertNotIn("cli_version", cached)
 
-    def test_snapshot_accepts_os_tmp_alias_but_still_rejects_target_symlink(self):
-        temp_root = Path(tempfile.gettempdir())
-        root = temp_root / "path-alias-test"
-        root.mkdir(parents=True, exist_ok=True)
-        tmp_real = Path(os.path.realpath("/tmp"))
-        try:
-            relative = temp_root.relative_to(tmp_real)
-            requested_root = Path("/tmp") / relative
-        except ValueError:
-            requested_root = temp_root
-        requested = requested_root / "path-alias-test" / "export.json"
-        result = model_catalog.snapshot(requested, "cursor", "default")
-        self.assertTrue(result["ok"], result)
-        self.assertTrue(Path(result["output"]).is_file())
-
-        target = root / "real.json"
-        target.write_text("{}\n", encoding="utf-8")
-        link = root / "link.json"
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(target)
-        refused = model_catalog.snapshot(link, "cursor", "default")
-        self.assertEqual(refused["reason"], "output_path_invalid")
 
     def test_codex_only_profile_schedule_pins_road_and_safe_bindings(self):
         home = Path(self.work) / ".codex-work"
@@ -504,131 +459,26 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertNotIn("hidden", result["plist"])
         self.assertNotIn("another-secret", result["plist"])
 
-    def test_cursor_effort_union_uses_exact_observed_slugs(self):
-        expected = (
-            ("claude-opus-5-5", "high", "claude-opus-5-5-high"),
-            ("gemini-4-argon", "high", "gemini-4-argon-high"),
-            ("grok-4.7", "xhigh", "grok-4.7-xhigh"),
-            ("muse-wonder-1.0", "high", "muse-wonder-1.0-high"),
-        )
-        for base, effort, wanted in expected:
-            slug, error = config.cursor_effort_slug(base, effort, "default")
-            self.assertIsNone(error, (base, effort))
-            self.assertEqual(slug, wanted)
-
-        self.assertEqual(
-            model_catalog._cursor_effort_candidates(["gpt-oss-120b-medium"]), {})
-        thinking = model_catalog._cursor_effort_candidates(
-            ["family-thinking-low", "family-thinking-high"])
-        self.assertEqual(thinking["family-thinking"], {
-            "low": "family-thinking-low", "high": "family-thinking-high"})
-
-    def test_cursor_local_catalog_adds_without_revoking_legacy_mapping(self):
-        payload = {"provider": "cursor", "models": [
-            {"id": "manual-family-low", "name": "Manual low"},
-            {"id": "manual-family-high", "name": "Manual high"},
-        ]}
-        path = self.write_json("cursor.json", payload)
-        imported = model_catalog.manual_import("cursor", "default", path)
-        self.assertTrue(imported["ok"], imported)
-        slug, error = config.cursor_effort_slug("manual-family", "high", "default")
+    def test_cursor_effort_slug_uses_the_static_table(self):
+        slug, error = config.cursor_effort_slug("gpt-5.6-sol", "xhigh", "default")
         self.assertIsNone(error)
-        self.assertEqual(slug, "manual-family-high")
-        self.assertEqual(config.cursor_effort_slug("gpt-5.6-sol", "xhigh", "default"),
-                         ("gpt-5.6-sol-xhigh", None))
-
-        ambiguous = self.write_json("ambiguous.json", {
-            "provider": "cursor",
-            "models": [{"id": "gpt-oss-120b-medium", "name": "gpt-oss-120b-medium"}],
-        })
-        self.assertTrue(model_catalog.manual_import("cursor", "default", ambiguous)["ok"])
-        slug, error = config.cursor_effort_slug("gpt-oss-120b", "medium", "default")
-        self.assertIsNone(slug)
-        self.assertEqual(error["reason"], "unsupported_effort")
+        self.assertEqual(slug, "gpt-5.6-sol-xhigh")
+        slug, error = config.cursor_effort_slug("gpt-5.5", "xhigh", "default")
+        self.assertIsNone(error)
+        self.assertEqual(slug, "gpt-5.5-extra-high")
+        for base in ("claude-opus-5-5", "gemini-4-argon", "grok-4.7", "muse-wonder-1.0"):
+            slug, error = config.cursor_effort_slug(base, "high", "default")
+            self.assertIsNone(slug, base)
+            self.assertEqual(error["reason"], "unsupported_effort", base)
 
     def test_route_prefix_is_additive_and_bare_gpt_stays_openai(self):
         self.assertEqual(resolve_route("agy/gpt-oss-120b-medium"), {
             "provider": "agy", "model": "gpt-oss-120b-medium"})
         self.assertEqual(resolve_route("gpt-oss-120b-medium")["provider"], "openai")
 
-    def test_all_five_manual_imports_round_trip_as_unknown(self):
-        imported_ids = {}
-        for provider in model_catalog.PROVIDERS:
-            model_id = "manual-%s-model" % provider
-            path = self.write_json(provider + ".json", self.manual_payload(
-                provider, model_id, observed_at="2020-01-02T03:04:05Z"))
-            result = model_catalog.manual_import(provider, "default", path)
-            self.assertTrue(result["ok"], (provider, result))
-            self.assertEqual(result["source"], "manual")
-            self.assertEqual(result["availability"], "unknown")
-            imported_ids[provider] = model_id
 
-        state = model_catalog.status("all", "default")
-        self.assertEqual([row["provider"] for row in state["catalogs"]],
-                         list(model_catalog.PROVIDERS))
-        self.assertTrue(all(row["source"] == "manual" for row in state["catalogs"]))
-        self.assertTrue(all(row["stale"] is True for row in state["catalogs"]))
-        self.assertEqual(model_catalog.check("all", "default")["exit_code"], 3)
 
-        output = Path(self.work) / "snapshot.json"
-        exported = model_catalog.snapshot(output, "all", "default")
-        self.assertTrue(exported["ok"], exported)
-        result = json.loads(output.read_text(encoding="utf-8"))
-        for provider, model_id in imported_ids.items():
-            record = result["providers"][provider]
-            self.assertEqual(record["source"], "manual")
-            self.assertEqual(record["availability"], "unknown")
-            self.assertEqual(record["observed_at"], "2020-01-02T03:04:05Z")
-            self.assertEqual(record["models"][0]["id"], model_id)
 
-    def test_manual_import_without_observation_time_does_not_invent_one(self):
-        path = self.write_json("manual-no-time.json", self.manual_payload(
-            "claude", "claude-manual"))
-        result = model_catalog.manual_import("claude", "default", path)
-        self.assertTrue(result["ok"], result)
-        self.assertIsNone(result["observed_at"])
-        state = model_catalog.status("claude", "default", details=True)
-        self.assertIsNone(state["catalogs"][0]["observed_at"])
-        self.assertIsNone(state["catalogs"][0]["age_seconds"])
-        self.assertEqual(state["catalogs"][0]["origin"], "local")
-        self.assertEqual(state["catalogs"][0]["models"][0]["id"], "claude-manual")
-
-    def test_manual_import_preserves_supplied_route_and_effort_known_for_validation(self):
-        seed = self.write_json("claude-last-good.json", self.manual_payload(
-            "claude", "claude-last-good"))
-        self.assertTrue(model_catalog.manual_import("claude", "default", seed)["ok"])
-        cache_path = model_catalog._cache_paths("claude", "default")[0]
-        last_good_bytes = cache_path.read_bytes()
-
-        cases = (
-            ({"id": "claude-route-conflict", "routable_id": "grok/claude-route-conflict",
-              "supported_efforts": []}, "routable_id_invalid"),
-            ({"id": "claude-known-string", "routable_id": "claude/claude-known-string",
-              "supported_efforts": [], "efforts_known": "false"},
-             "effort_metadata_invalid"),
-            ({"id": "claude-unknown-with-efforts",
-              "routable_id": "claude/claude-unknown-with-efforts",
-              "supported_efforts": ["low"], "efforts_known": False},
-             "effort_metadata_invalid"),
-        )
-        for row, reason in cases:
-            with self.subTest(reason=reason):
-                source = self.write_json("invalid-%s.json" % row["id"], {
-                    "provider": "claude", "models": [row]})
-                result = model_catalog.manual_import("claude", "default", source)
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["reason"], reason)
-                self.assertEqual(cache_path.read_bytes(), last_good_bytes)
-
-    def test_bundled_snapshot_has_no_machine_paths_and_uses_road_prefixes(self):
-        path = Path(__file__).resolve().parent.parent / "providers" / "model_catalog.json"
-        encoded = path.read_bytes()
-        self.assertNotIn(b"/Users/", encoded)
-        self.assertNotIn(b"/private/tmp/", encoded)
-        for provider, record in model_catalog.bundled_catalog().items():
-            self.assertEqual(record["provider"], provider)
-            for row in record["models"]:
-                self.assertTrue(row["routable_id"].startswith(provider + "/"))
 
     def test_profile_endpoint_and_home_changes_isolate_cache_without_secrets(self):
         keys = ("OMNI_LLM_CURSOR_CONFIG_DIR_WORK", "CURSOR_API_KEY_WORK",
@@ -648,7 +498,8 @@ class ModelCatalogTests(unittest.TestCase):
         os.environ["OMNI_LLM_CURSOR_CONFIG_DIR_WORK"] = str(home_one)
         os.environ["CURSOR_API_KEY_WORK"] = "test-secret-one"
         os.environ["OMNI_LLM_CATALOG_ENDPOINT_CURSOR_WORK"] = "https://one.example/v1?token=hidden"
-        first_path = model_catalog._cache_paths("cursor", "work", create=True)[0]
+        from providers import catalog_v2
+        first_path = catalog_v2._paths("cursor", "work", create=True)[0]
         first_fingerprint = model_catalog._scope_fingerprint("cursor", "work", create=True)
 
         os.environ["CURSOR_API_KEY_WORK"] = "test-secret-two"
@@ -658,19 +509,16 @@ class ModelCatalogTests(unittest.TestCase):
         second_fingerprint = model_catalog._scope_fingerprint("cursor", "work", create=True)
         self.assertNotEqual(first_fingerprint, second_fingerprint)
         os.environ["OMNI_LLM_CURSOR_CONFIG_DIR_WORK"] = str(home_two)
-        third_path = model_catalog._cache_paths("cursor", "work", create=True)[0]
+        third_path = catalog_v2._paths("cursor", "work", create=True)[0]
         self.assertNotEqual(first_path, third_path)
 
-        path = self.write_json("private-profile.json", self.manual_payload(
-            "cursor", "private-model"))
-        self.assertTrue(model_catalog.manual_import("cursor", "work", path)["ok"])
-        snapshot_path = Path(self.work) / "profile-snapshot.json"
-        self.assertTrue(model_catalog.snapshot(snapshot_path, "cursor", "work")["ok"])
+        self.save_v2("cursor", "work", "private-model")
         for file in Path(self.state).rglob("*"):
             if file.is_file():
-                self.assertNotIn(b"test-secret", file.read_bytes())
-        self.assertNotIn(b"one.example", snapshot_path.read_bytes())
-        self.assertNotIn(b"hidden", snapshot_path.read_bytes())
+                body = file.read_bytes()
+                self.assertNotIn(b"test-secret", body)
+                self.assertNotIn(b"one.example", body)
+                self.assertNotIn(b"hidden", body)
 
     def test_agy_named_profile_requires_and_fingerprints_its_config_home(self):
         first = Path(self.work) / "agy-profile-one"
@@ -687,11 +535,30 @@ class ModelCatalogTests(unittest.TestCase):
                 model_catalog._scope_fingerprint("agy", "work", create=True)
         self.assertEqual(caught.exception.reason, "unsupported_profile")
 
-    def test_refresh_output_cap_and_malformed_result_preserve_last_good_bytes(self):
-        path = self.write_json("cursor-good.json", self.manual_payload(
-            "cursor", "cursor-good"))
-        self.assertTrue(model_catalog.manual_import("cursor", "default", path)["ok"])
-        cache_path = model_catalog._cache_paths("cursor", "default")[0]
+    def test_unauthenticated_grok_listing_fails_without_replacing_last_good(self):
+        from providers import catalog_record
+        unauthenticated = (FIXTURES / "model_catalog_grok_unauthenticated.txt").read_text(
+            encoding="utf-8")
+        with self.assertRaises(catalog_record.StrictRecordError) as caught:
+            catalog_record.parse_grok_output(unauthenticated)
+        self.assertEqual(caught.exception.reason, "catalog_unreadable")
+
+        cache_path = self.save_v2("grok", "default", "grok-last-good")
+        before = cache_path.read_bytes()
+
+        def unauthenticated_discovery(_profile, _timeout):
+            return catalog_record.parse_grok_output(unauthenticated)
+
+        with mock.patch.dict(model_catalog._DISCOVERERS,
+                             {"grok": unauthenticated_discovery}), \
+                mock.patch.object(model_catalog, "_best_effort_cli_version", return_value=None):
+            result = model_catalog.refresh("grok", "default", 5)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["providers"]["grok"]["reason"], "catalog_unreadable")
+        self.assertEqual(cache_path.read_bytes(), before)
+
+    def test_refresh_output_cap_and_malformed_result_leave_the_v2_record(self):
+        cache_path = self.save_v2("cursor", "default", "cursor-good")
         original = cache_path.read_bytes()
 
         def too_large(_profile, _timeout):
@@ -704,7 +571,7 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(result["providers"]["cursor"]["reason"], "output_cap")
         self.assertEqual(cache_path.read_bytes(), original)
         self.assertEqual(model_catalog.status("cursor", "default")["catalogs"][0]
-                         ["last_refresh"]["reason"], "output_cap")
+                         ["model_count"], 1)
 
         def partial(_profile, _timeout):
             return model_catalog.parse_cursor_output("cursor-id - label")
@@ -715,54 +582,14 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(result["providers"]["cursor"]["reason"], "incomplete_output")
         self.assertEqual(cache_path.read_bytes(), original)
 
-    def test_cache_commit_reports_success_when_status_write_fails(self):
-        initial = self.write_json("cursor-status-initial.json", self.manual_payload(
-            "cursor", "cursor-before-status-failure"))
-        self.assertTrue(model_catalog.manual_import("cursor", "default", initial)["ok"])
-        cache_path, status_path, _lock_path = model_catalog._cache_paths(
-            "cursor", "default")
-        original_cache = cache_path.read_bytes()
-        status_target = Path(self.work) / "status-target.json"
-        target_bytes = b"status target sentinel\n"
-        status_target.write_bytes(target_bytes)
-        status_path.unlink()
-        status_path.symlink_to(status_target)
-
-        refreshed_record = model_catalog.bundled_catalog()["cursor"]
-        with mock.patch.dict(model_catalog._DISCOVERERS,
-                             {"cursor": lambda _profile, _timeout: refreshed_record}), \
-                mock.patch.object(model_catalog, "_best_effort_cli_version",
-                                  return_value=None):
-            refreshed = model_catalog.refresh("cursor", "default", 5)
-        provider_result = refreshed["providers"]["cursor"]
-        self.assertTrue(refreshed["ok"], refreshed)
-        self.assertTrue(provider_result["ok"], provider_result)
-        self.assertEqual(provider_result["status_diagnostic"], "status_write_failed")
-        self.assertNotIn("last_good_preserved", provider_result)
-        self.assertNotEqual(cache_path.read_bytes(), original_cache)
-        cached, _info = model_catalog._load_cached("cursor", "default")
-        self.assertEqual(cached["models"], refreshed_record["models"])
-        self.assertEqual(status_target.read_bytes(), target_bytes)
-        self.assertTrue(status_path.is_symlink())
-
-        manual = self.write_json("cursor-status-manual.json", self.manual_payload(
-            "cursor", "cursor-after-status-failure"))
-        before_manual = cache_path.read_bytes()
-        with mock.patch.object(model_catalog, "_write_status",
-                               side_effect=PermissionError("synthetic status failure")):
-            imported = model_catalog.manual_import("cursor", "default", manual)
-        self.assertTrue(imported["ok"], imported)
-        self.assertEqual(imported["status_diagnostic"], "status_write_failed")
-        self.assertNotIn("last_good_preserved", imported)
-        self.assertNotEqual(cache_path.read_bytes(), before_manual)
-        cached, _info = model_catalog._load_cached("cursor", "default")
-        self.assertEqual(cached["models"][0]["id"], "cursor-after-status-failure")
-        self.assertEqual(status_target.read_bytes(), target_bytes)
 
     def test_refresh_all_keeps_success_when_another_provider_fails(self):
-        bundle = model_catalog.bundled_catalog()
-        discoverers = {name: (lambda _profile, _timeout, record=record: record)
-                       for name, record in bundle.items()}
+        from providers import catalog_v2
+        discoverers = {}
+        for name in model_catalog.PROVIDERS:
+            record = self.live_record(name, name + "-one")
+            discoverers[name] = (lambda _profile, _timeout, record=record: record)
+
         def agy_failure(_profile, _timeout):
             raise model_catalog.CatalogError("auth_error", "agy")
         discoverers["agy"] = agy_failure
@@ -772,30 +599,34 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["providers"]["cursor"]["ok"])
         self.assertEqual(result["providers"]["agy"]["reason"], "auth_error")
-        cursor, _info = model_catalog._load_cached("cursor", "default")
-        agy, _info = model_catalog._load_cached("agy", "default")
+        self.assertNotIn("preserved", json.dumps(result["providers"]["agy"]))
+        cursor, reason = catalog_v2.load("cursor", "default")
+        agy, agy_reason = catalog_v2.load("agy", "default")
+        self.assertIsNone(reason)
         self.assertIsNotNone(cursor)
         self.assertIsNone(agy)
+        self.assertIsNone(agy_reason)
 
     def test_atomic_cache_writers_leave_only_complete_records_for_readers(self):
         from threading import Thread
-        first = self.write_json("first.json", self.manual_payload("cursor", "cursor-first"))
-        second = self.write_json("second.json", self.manual_payload("cursor", "cursor-second"))
-        self.assertTrue(model_catalog.manual_import("cursor", "default", first)["ok"])
+        from providers import catalog_v2
+        first = self.live_record("cursor", "cursor-first")
+        second = self.live_record("cursor", "cursor-second")
+        catalog_v2.save("cursor", "default", first)
         failures = []
         def writer():
             for index in range(30):
-                path = first if index % 2 else second
-                result = model_catalog.manual_import("cursor", "default", path)
-                if not result.get("ok"):
-                    failures.append(result)
+                try:
+                    catalog_v2.save("cursor", "default", first if index % 2 else second)
+                except Exception as exc:
+                    failures.append(exc)
         thread = Thread(target=writer)
         thread.start()
         reads = 0
         while thread.is_alive() or reads < 30:
-            record, _info = model_catalog._load_cached("cursor", "default")
-            if record is None or len(record["models"]) != 1:
-                failures.append("partial cache")
+            record, reason = catalog_v2.load("cursor", "default")
+            if reason or record is None or len(record["models"]) != 1:
+                failures.append(reason or "partial cache")
             else:
                 self.assertIn(record["models"][0]["id"],
                               ("cursor-first", "cursor-second"))
@@ -811,151 +642,35 @@ class ModelCatalogTests(unittest.TestCase):
             checked = model_catalog.check("all", "default")
         self.assertTrue(value["ok"])
         self.assertEqual(len(value["catalogs"]), 5)
+        self.assertTrue(all(row["model_count"] == 0 for row in value["catalogs"]))
         self.assertEqual(checked["exit_code"], 2)
-        self.assertEqual(checked["unusable"], list(model_catalog.PROVIDERS))
+        self.assertNotIn("unusable", checked)
+        self.assertTrue(all(not row["ok"] for row in checked["providers"]))
 
-    def test_status_details_lists_normalized_ids_without_refreshing(self):
+    def test_status_details_lists_ids_and_names_without_refreshing(self):
+        self.save_v2("cursor", "default", "cursor-listed")
         with mock.patch.dict(model_catalog._DISCOVERERS,
                              {name: mock.Mock(side_effect=AssertionError("network"))
                               for name in model_catalog.PROVIDERS}):
             value = model_catalog.status("cursor", "default", details=True)
         self.assertTrue(value["details"])
-        models = value["catalogs"][0]["models"]
-        self.assertEqual(len(models), 265)
-        self.assertIn("grok-4.7-high", {row["id"] for row in models})
+        self.assertEqual(value["catalogs"][0]["models"],
+                         [{"id": "cursor-listed", "name": "cursor-listed"}])
 
-    def test_check_reports_added_removed_efforts_and_default_availability(self):
-        changed = self.write_json("cursor-drift.json", {
-            "provider": "cursor",
-            "models": [{"id": "new-cursor-model", "name": "new-cursor-model"}],
-        })
-        self.assertTrue(model_catalog.manual_import("cursor", "default", changed)["ok"])
-        result = model_catalog.check("cursor", "default")
-        self.assertEqual(result["exit_code"], 3)
-        row = result["providers"][0]
-        self.assertIn("new-cursor-model", row["added"])
-        self.assertIn("auto", row["removed"])
-        self.assertFalse(row["default_availability"]["local_available"])
 
-        effort_file = self.write_json("effort-drift.json", {
-            "provider": "cursor",
-            "models": [{"id": "claude-opus-5-5-high",
-                         "supported_efforts": ["low"]}],
-        })
-        self.assertTrue(model_catalog.manual_import("cursor", "default", effort_file)["ok"])
-        effort_check = model_catalog.check("cursor", "default")
-        self.assertIn("claude-opus-5-5-high",
-                      effort_check["providers"][0]["effort_changes"])
 
-    def test_snapshot_preserves_original_observation_and_checks_output_symlinks(self):
-        observed = "2019-12-31T23:59:59Z"
-        path = self.write_json("manual-grok.json", self.manual_payload(
-            "grok", "grok-manual", observed_at=observed))
-        self.assertTrue(model_catalog.manual_import("grok", "default", path)["ok"])
-        output = Path(self.work) / "promoted.json"
-        self.assertTrue(model_catalog.snapshot(output, "grok", "default")["ok"])
-        exported = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(exported["providers"]["grok"]["observed_at"], observed)
-        self.assertEqual(exported["providers"]["grok"]["source"], "manual")
-        self.assertNotEqual(exported["exported_at"], observed)
-        self.assertEqual(exported["providers"]["cursor"]["source"],
-                         model_catalog.bundled_catalog()["cursor"]["source"])
 
-        link = Path(self.work) / "snapshot-link.json"
-        link.symlink_to(output)
-        refused = model_catalog.snapshot(link, "grok", "default")
-        self.assertFalse(refused["ok"])
-        self.assertEqual(refused["reason"], "output_path_invalid")
 
-        corrupt = Path(self.work) / "corrupt.json"
-        corrupt.write_text('{"schema_version":1,"providers":{"unknown":{}}}',
-                           encoding="utf-8")
-        refused = model_catalog.snapshot(corrupt, "cursor", "default")
-        self.assertFalse(refused["ok"])
-        self.assertEqual(refused["reason"], "snapshot_invalid")
-
-    def test_snapshot_refuses_broken_identity_without_changing_destination(self):
-        bundle = model_catalog.bundled_catalog()
-        previous_snapshot = {
-            "schema_version": model_catalog.SCHEMA_VERSION,
-            "providers": bundle,
-        }
-        destination_bytes = (json.dumps(previous_snapshot, sort_keys=True,
-                                        ensure_ascii=False) + "\n").encode("utf-8")
-        original_read_bytes = Path.read_bytes
-        for state_name, failure in (("truncated", "truncated"),
-                                    ("unreadable", "unreadable"),
-                                    ("missing", "missing")):
-            with self.subTest(identity_state=state_name):
-                state = Path(self.work) / ("state-" + state_name)
-                source = self.write_json("identity-%s.json" % state_name,
-                                         self.manual_payload("cursor", "cursor-seed"))
-                destination = Path(self.work) / ("destination-%s.json" % state_name)
-                destination.write_bytes(destination_bytes)
-                with mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": str(state)}):
-                    self.assertTrue(model_catalog.manual_import(
-                        "cursor", "default", source)["ok"])
-                    root = model_catalog._catalog_root()
-                    cache_path, _status_path, _lock_path = model_catalog._cache_paths(
-                        "cursor", "default")
-                    self.assertTrue(cache_path.is_file())
-                    identity_path = root / ".identity-key"
-                    if failure == "truncated":
-                        identity_path.write_bytes(b"x")
-                    elif failure == "missing":
-                        identity_path.unlink()
-
-                    if failure == "unreadable":
-                        def denied_identity_read(path):
-                            if path == identity_path:
-                                raise PermissionError("synthetic identity read denial")
-                            return original_read_bytes(path)
-
-                        with mock.patch.object(Path, "read_bytes", denied_identity_read):
-                            with self.assertRaises(model_catalog.CatalogError) as caught:
-                                model_catalog._scope_fingerprint(
-                                    "cursor", "default", create=True)
-                            self.assertEqual(caught.exception.reason,
-                                             "cache_identity_invalid")
-                            refused = model_catalog.snapshot(
-                                destination, "cursor", "default")
-                    else:
-                        with self.assertRaises(model_catalog.CatalogError) as caught:
-                            model_catalog._scope_fingerprint(
-                                "cursor", "default", create=True)
-                        self.assertEqual(caught.exception.reason,
-                                         "cache_identity_invalid")
-                        refused = model_catalog.snapshot(
-                            destination, "cursor", "default")
-                    self.assertFalse(refused["ok"], refused)
-                    self.assertEqual(refused["reason"], "cache_invalid")
-                    self.assertEqual(destination.read_bytes(), destination_bytes)
-                    if failure == "truncated":
-                        self.assertEqual(identity_path.read_bytes(), b"x")
-                    elif failure == "missing":
-                        self.assertFalse(identity_path.exists())
-
-        fresh_state = Path(self.work) / "fresh-state"
-        fresh_destination = Path(self.work) / "fresh-export.json"
-        with mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": str(fresh_state)}):
-            fresh = model_catalog.snapshot(fresh_destination, "cursor", "default")
-        self.assertTrue(fresh["ok"], fresh)
-        exported = json.loads(fresh_destination.read_text(encoding="utf-8"))
-        self.assertEqual(exported["providers"]["cursor"], bundle["cursor"])
-        self.assertFalse(fresh_state.exists())
-
-    def test_corrupt_local_cache_falls_back_to_bundle_with_diagnostic(self):
-        cache_path = model_catalog._cache_paths("cursor", "default", create=True)[0]
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    def test_corrupt_v2_record_is_unreadable(self):
+        cache_path = self.save_v2("cursor", "default", "cursor-listed")
         cache_path.write_bytes(b'{"partial":')
         result = model_catalog.status("cursor", "default")
         self.assertTrue(result["ok"])
-        self.assertEqual(result["catalogs"][0]["source"], "live")
-        self.assertEqual(result["catalogs"][0]["origin"], "bundled")
-        self.assertEqual(result["catalogs"][0]["cache_diagnostic"], "cache_invalid")
-        slug, error = config.cursor_effort_slug("grok-4.7", "xhigh", "default")
+        self.assertEqual(result["catalogs"][0]["model_count"], 0)
+        self.assertEqual(result["catalogs"][0]["reason"], "catalog_unreadable")
+        slug, error = config.cursor_effort_slug("gpt-5.6-sol", "xhigh", "default")
         self.assertIsNone(error)
-        self.assertEqual(slug, "grok-4.7-xhigh")
+        self.assertEqual(slug, "gpt-5.6-sol-xhigh")
 
     def test_launchd_plist_is_explicit_and_profile_scoped(self):
         cursor_profile = Path(self.work) / "cursor-profile"
@@ -1200,9 +915,10 @@ class ModelCatalogTests(unittest.TestCase):
             captured["spawn_env"] = dict(env)
             return proc
 
-        with mock.patch.dict(os.environ, {
-                "OMNI_LLM_CHILD_ENV_PASS": "CLAUDE_CODE_PLUGIN_DIRS",
-                "CLAUDE_CODE_PLUGIN_DIRS": "/synthetic/plugin-dir"}), \
+        with mock.patch("platform.system", return_value="Darwin"), \
+                mock.patch.dict(os.environ, {
+                    "OMNI_LLM_CHILD_ENV_PASS": "CLAUDE_CODE_PLUGIN_DIRS",
+                    "CLAUDE_CODE_PLUGIN_DIRS": "/synthetic/plugin-dir"}), \
                 mock.patch("providers.kernel_sandbox.resolve_agent_binary",
                            return_value="/usr/bin/claude"), \
                 mock.patch("providers.host_fence.prepare_host_fence", side_effect=prepare), \
@@ -1319,11 +1035,7 @@ class ModelCatalogTests(unittest.TestCase):
                          "https://api.example/v1?api-version=2024-11")
 
     def test_secret_endpoint_refuses_before_hash_store_and_read_side_writes(self):
-        safe_payload = self.write_json("claude-secret-endpoint-last-good.json",
-                                       self.manual_payload("claude", "claude-last-good"))
-        self.assertTrue(model_catalog.manual_import(
-            "claude", "default", safe_payload)["ok"])
-        cache_path = model_catalog._cache_paths("claude", "default")[0]
+        cache_path = self.save_v2("claude", "default", "claude-last-good")
         previous_bytes = cache_path.read_bytes()
         synthetic_key = "synthetic-astra-hash-boundary-key-20261017"
         unsafe_url = "https://api.example/v1/path/" + synthetic_key
@@ -1335,12 +1047,9 @@ class ModelCatalogTests(unittest.TestCase):
                 model_catalog._scope_fingerprint("claude", "default")
             self.assertEqual(caught.exception.reason, "endpoint_secret_refused")
 
-            imported = model_catalog.manual_import("claude", "default", safe_payload)
-            self.assertFalse(imported["ok"])
-            self.assertEqual(imported["reason"], "endpoint_secret_refused")
             with mock.patch.dict(model_catalog._DISCOVERERS, {
                     "claude": lambda _profile, _timeout:
-                    model_catalog.bundled_catalog()["claude"]}), \
+                    self.live_record("claude", "claude-live")}), \
                     mock.patch.object(model_catalog, "_best_effort_cli_version",
                                       return_value=None):
                 refreshed = model_catalog.refresh("claude", "default", 5)
@@ -1356,9 +1065,10 @@ class ModelCatalogTests(unittest.TestCase):
             status = model_catalog.status("claude", "default")
             checked = model_catalog.check("claude", "default")
         self.assertTrue(status["ok"])
-        self.assertEqual(status["catalogs"][0]["cache_diagnostic"],
-                         "endpoint_secret_refused")
-        self.assertEqual(checked["providers"][0]["reason"], "endpoint_secret_refused")
+        self.assertEqual(status["catalogs"][0]["reason"], "catalog_unreadable")
+        self.assertEqual(checked["exit_code"], 2)
+        self.assertEqual(checked["providers"][0]["admission"][0]["refusal"],
+                         "catalog_unreadable")
         self.assertFalse(read_only_state.exists())
         self.assertNotIn(synthetic_key, json.dumps(status))
         self.assertNotIn(synthetic_key, json.dumps(checked))
@@ -1408,7 +1118,8 @@ class ModelCatalogTests(unittest.TestCase):
             return list(argv), kwargs["env"], \
                 _verified_read_only_fence_metadata()
 
-        with mock.patch("providers.host_fence.prepare_host_fence", fake_prepare), \
+        with mock.patch("platform.system", return_value="Darwin"), \
+                mock.patch("providers.host_fence.prepare_host_fence", fake_prepare), \
                 mock.patch.object(model_catalog.subprocess, "Popen", return_value=proc):
             record = model_catalog._query_codex_models(
                 "/usr/bin/codex", env={"PATH": "/usr/bin"}, cwd=self.work,
@@ -1504,7 +1215,8 @@ time.sleep(60)
 
         started = time.monotonic()
         watchdog_fired = False
-        with mock.patch("providers.host_fence.prepare_host_fence", prepare), \
+        with mock.patch("platform.system", return_value="Darwin"), \
+                mock.patch("providers.host_fence.prepare_host_fence", prepare), \
                 mock.patch.object(model_catalog.subprocess, "Popen", side_effect=capture_popen):
             worker = threading.Thread(target=query, daemon=True)
             worker.start()
@@ -1528,12 +1240,9 @@ time.sleep(60)
         self.assertLess(elapsed, 2.5)
         self.assertIsNotNone(spawned[0].poll(), "query did not reap the fake child")
 
-    def test_codex_live_metadata_rejects_bad_rows_and_efforts_without_cache_replace(self):
-        previous_payload = self.write_json("codex-last-good.json", self.manual_payload(
-            "codex", "codex-last-good"))
-        self.assertTrue(model_catalog.manual_import(
-            "codex", "default", previous_payload)["ok"])
-        cache_path = model_catalog._cache_paths("codex", "default")[0]
+    def test_codex_live_metadata_rejects_bad_rows_without_replacing_v2(self):
+        from providers import catalog_v2
+        cache_path = self.save_v2("codex", "default", "codex-last-good")
         last_good_bytes = cache_path.read_bytes()
 
         class FakeProc:
@@ -1572,7 +1281,8 @@ time.sleep(60)
                 return list(argv), kwargs["env"], \
                     _verified_read_only_fence_metadata()
 
-            with mock.patch("providers.host_fence.prepare_host_fence", side_effect=prepare), \
+            with mock.patch("platform.system", return_value="Darwin"), \
+                    mock.patch("providers.host_fence.prepare_host_fence", side_effect=prepare), \
                     mock.patch.object(model_catalog.subprocess, "Popen", return_value=proc), \
                     mock.patch.dict(model_catalog._DISCOVERERS, {"codex": discover}), \
                     mock.patch.object(model_catalog, "_best_effort_cli_version", return_value=None):
@@ -1586,29 +1296,14 @@ time.sleep(60)
 
         valid_row = {"model": "codex-page-one", "displayName": "Page one"}
         invalid_cases = (
-            ("non_dict_later_page", [[valid_row], [None]], "model_entry_invalid"),
-            ("unknown_effort_string", [[{"model": "codex-none-string",
-                                         "supportedReasoningEfforts": ["none"]}]],
-             "effort_metadata_invalid"),
-            ("unknown_effort_object", [[{"model": "codex-none-object",
-                                         "supportedReasoningEfforts": [
-                                             {"reasoningEffort": "none"}]}]],
-             "effort_metadata_invalid"),
+            ("non_dict_later_page", [[valid_row], [None]], "catalog_unreadable"),
             ("wrong_effort_shape", [[{"model": "codex-wrong-shape",
                                       "supportedReasoningEfforts": "low"}]],
-             "effort_metadata_invalid"),
-            ("conflicting_default", [[{"model": "codex-default-conflict",
-                                        "supportedReasoningEfforts": ["low"],
-                                        "defaultReasoningEffort": "high"}]],
-             "effort_metadata_invalid"),
-            ("unknown_default", [[{"model": "codex-default-unknown",
-                                    "supportedReasoningEfforts": ["low"],
-                                    "defaultReasoningEffort": "none"}]],
-             "effort_metadata_invalid"),
+             "catalog_unreadable"),
             ("wrong_type_default", [[{"model": "codex-default-wrong-type",
                                        "supportedReasoningEfforts": ["low"],
                                        "defaultReasoningEffort": 7}]],
-             "effort_metadata_invalid"),
+             "catalog_unreadable"),
         )
         for label, pages, reason in invalid_cases:
             with self.subTest(case=label):
@@ -1625,15 +1320,20 @@ time.sleep(60)
                 {"reasoningEffort": "high", "description": "Higher reasoning"}]},
             {"model": "codex-effort-default",
              "supportedReasoningEfforts": ["low"], "defaultReasoningEffort": "low"},
+            {"model": "codex-effort-none", "supportedReasoningEfforts": ["none"]},
         ]])
         self.assertTrue(valid_result["ok"], valid_result)
-        cached, _info = model_catalog._load_cached("codex", "default")
+        cached, reason = catalog_v2.load("codex", "default")
+        self.assertIsNone(reason)
         rows = {row["id"]: row for row in cached["models"]}
         self.assertFalse(rows["codex-effort-absent"]["efforts_known"])
+        self.assertEqual(rows["codex-effort-absent"]["effort_field"], "absent")
         self.assertTrue(rows["codex-effort-empty"]["efforts_known"])
+        self.assertEqual(rows["codex-effort-empty"]["effort_field"], "empty")
         self.assertEqual(rows["codex-effort-string"]["supported_efforts"], ["low"])
         self.assertEqual(rows["codex-effort-object"]["supported_efforts"], ["high"])
         self.assertEqual(rows["codex-effort-default"]["default_effort"], "low")
+        self.assertEqual(rows["codex-effort-none"]["supported_efforts"], ["none"])
 
     def test_codex_rpc_rejects_server_requests_and_non_metadata_methods(self):
         class Reader:

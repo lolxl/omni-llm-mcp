@@ -22,6 +22,22 @@ if ROOT not in sys.path:
 
 from providers import agent_lane
 from providers import jobs
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 TW_MOBILE = "0912345678"
@@ -78,6 +94,10 @@ class TestAgentLaneRefuse(unittest.TestCase):
     """Entry: providers/agent_lane.py run_agent → refuse_payload(task)
     before run_cli. Covers grok --prompt-file and claude/codex/pi stdin.
     """
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def _run_agent(self, model, which_bin, task):
         sent = []

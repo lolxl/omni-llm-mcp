@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from providers import agent_lane
+from tests import offline_home
 
 
 def _run(coro):
@@ -25,9 +26,16 @@ def _git_workdir():
 
 _STATE_PATCH = None
 _STATE_DIR = None
+_HOME = None
 
 
 def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module. It goes
+    # first (and closes last): the state-dir patch below must not be scrubbed.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
     # #168: a write-mode run records a repository's protected branches under the
     # state dir. Keep these fixtures' repositories out of the real one.
     global _STATE_PATCH, _STATE_DIR
@@ -38,13 +46,19 @@ def setUpModule():
 
 def tearDownModule():
     import shutil
-    _STATE_PATCH.stop()
-    shutil.rmtree(_STATE_DIR, ignore_errors=True)
+    try:
+        _STATE_PATCH.stop()
+        shutil.rmtree(_STATE_DIR, ignore_errors=True)
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 
 class TestWorkspaceWrites(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.workdir = _git_workdir()
         self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
         self.old_depth = os.environ.pop(agent_lane.ENV_DEPTH, None)
@@ -160,6 +174,148 @@ class TestWorkspaceWritesCounting(unittest.TestCase):
         self.assertNotEqual(before["head"], after["head"])
         count, _ = agent_lane._workspace_writes(self.workdir, before, after)
         self.assertEqual(count, 1)
+
+    def _write(self, name, text):
+        with open(os.path.join(self.workdir, name), "w") as handle:
+            handle.write(text)
+
+    def test_content_change_of_already_modified_tracked_file_counts(self):
+        self._write("t.txt", "one")
+        self._git("add", "t.txt"); self._git("commit", "-q", "-m", "add t")
+        self._write("t.txt", "two")             # " M" before the run
+        before = self._snap()
+        self._write("t.txt", "three!")          # still " M", new content
+        after = self._snap()
+        self.assertEqual(before["entries"], after["entries"])
+        count, _ = agent_lane._workspace_writes(self.workdir, before, after)
+        self.assertEqual(count, 1)
+
+    def test_rewritten_untracked_file_counts(self):
+        self._write("u.txt", "one")             # "??" before the run
+        before = self._snap()
+        self._write("u.txt", "two")
+        count, _ = agent_lane._workspace_writes(self.workdir, before, self._snap())
+        self.assertEqual(count, 1)
+
+    def test_untouched_dirty_file_counts_zero(self):
+        self._write("t.txt", "one")
+        self._git("add", "t.txt"); self._git("commit", "-q", "-m", "add t")
+        self._write("t.txt", "two")
+        self._write("u.txt", "untracked")
+        before = self._snap()
+        count, _ = agent_lane._workspace_writes(self.workdir, before, self._snap())
+        self.assertEqual(count, 0)
+
+    def test_symlink_is_fingerprinted_by_target_name_not_bytes(self):
+        outside = tempfile.mkdtemp(prefix="omni243_out_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = os.path.join(outside, "secret.txt")
+        with open(target, "w") as handle:
+            handle.write("outside bytes")
+        os.symlink(target, os.path.join(self.workdir, "lnk"))
+        self.assertEqual(agent_lane._path_fingerprint(self.workdir, "lnk"),
+                         "link:" + target)
+        self.assertEqual(self._snap()["digests"]["lnk"], "link:" + target)
+        # Never read through the link: no open of any kind during the call.
+        with mock.patch("builtins.open", side_effect=AssertionError("open")), \
+                mock.patch("os.open", side_effect=AssertionError("os.open")):
+            self.assertEqual(agent_lane._path_fingerprint(self.workdir, "lnk"),
+                             "link:" + target)
+
+    def test_regular_file_fingerprint_is_stat_tuple(self):
+        self._write("f.txt", "abc")
+        st = os.lstat(os.path.join(self.workdir, "f.txt"))
+        self.assertEqual(
+            agent_lane._path_fingerprint(self.workdir, "f.txt"),
+            (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
+
+    def test_quoted_path_rewrite_counts(self):
+        names = ("a b.txt", "café.txt")
+        for name in names:
+            self._write(name, "one")
+            self._git("add", name)
+        self._git("commit", "-q", "-m", "add quoted")
+        for name in names:
+            self._write(name, "two")            # " M" before the run
+        before = self._snap()
+        for name in names:
+            self._write(name, "three!")         # size changes, same letters
+        after = self._snap()
+        self.assertEqual(before["entries"], after["entries"])
+        self.assertEqual(len(before["entries"]), 2)
+        for fp in before["digests"].values():
+            self.assertIsNotNone(fp)            # quoted names were unquoted
+        count, _ = agent_lane._workspace_writes(self.workdir, before, after)
+        self.assertEqual(count, 2)
+
+    def test_quoted_path_rewrite_counts_with_quotepath_false(self):
+        self._git("config", "core.quotePath", "false")
+        names = ("中 文.txt", "café x.txt")
+        for name in names:
+            self._write(name, "one")
+            self._git("add", name)
+        self._git("commit", "-q", "-m", "add quoted")
+        for name in names:
+            self._write(name, "two")
+        before = self._snap()
+        for name in names:
+            self._write(name, "three!")
+        after = self._snap()
+        self.assertEqual(before["entries"], after["entries"])
+        self.assertEqual(len(before["entries"]), 2)
+        for fp in before["digests"].values():
+            self.assertIsNotNone(fp)
+        count, _ = agent_lane._workspace_writes(self.workdir, before, after)
+        self.assertEqual(count, 2)
+
+    def test_unquote_porcelain_path(self):
+        self.assertEqual(agent_lane._unquote_porcelain_path('"a b.txt"'), "a b.txt")
+        self.assertEqual(agent_lane._unquote_porcelain_path(r'"caf\303\251.txt"'),
+                         "café.txt")
+        self.assertEqual(agent_lane._unquote_porcelain_path("plain.txt"), "plain.txt")
+        self.assertEqual(agent_lane._unquote_porcelain_path(r'"a\tb.txt"'), "a\tb.txt")
+        self.assertEqual(agent_lane._unquote_porcelain_path(r'"a\"b.txt"'), 'a"b.txt')
+        self.assertEqual(agent_lane._unquote_porcelain_path(r'"a\\b.txt"'), "a\\b.txt")
+        self.assertEqual(agent_lane._unquote_porcelain_path('"中 文.txt"'), "中 文.txt")
+
+    def test_symlinked_parent_dir_is_not_read(self):
+        os.mkdir(os.path.join(self.workdir, "d"))
+        self._write(os.path.join("d", "x"), "one")
+        self._git("add", "d/x")
+        self._git("commit", "-q", "-m", "add d/x")
+        outside = tempfile.mkdtemp(prefix="omni243_out_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        with open(os.path.join(outside, "x"), "w") as handle:
+            handle.write("outside")
+        os.rename(os.path.join(self.workdir, "d"),
+                  os.path.join(self.workdir, "d_moved"))
+        os.symlink(outside, os.path.join(self.workdir, "d"))
+        with mock.patch("builtins.open", side_effect=AssertionError("open")), \
+                mock.patch("os.open", side_effect=AssertionError("os.open")):
+            snap = agent_lane._workspace_snapshot(self.workdir)
+        self.assertEqual(snap["state"], "ok")
+
+    def test_unsafe_or_unreadable_paths_have_no_fingerprint(self):
+        self._write("f.txt", "x")
+        os.mkdir(os.path.join(self.workdir, "d"))
+        for path in ("../f.txt", "a/../f.txt", os.path.join(self.workdir, "f.txt"),
+                     "d", "missing.txt", ""):
+            with self.subTest(path=path):
+                self.assertIsNone(agent_lane._path_fingerprint(self.workdir, path))
+        self.assertIsNotNone(agent_lane._path_fingerprint(self.workdir, "f.txt"))
+
+    def test_old_shape_snapshots_without_digests_compare_by_letters(self):
+        before = {"state": "ok", "entries": {"a": " M", "b": "??"}, "head": None}
+        same = {"state": "ok", "entries": {"a": " M", "b": "??"}, "head": None}
+        self.assertEqual(agent_lane._workspace_writes(self.workdir, before, same),
+                         (0, None))
+        letters = {"state": "ok", "entries": {"a": "M ", "b": "??"}, "head": None}
+        self.assertEqual(agent_lane._workspace_writes(self.workdir, before, letters),
+                         (1, None))
+        # One side with digests, the other without: still letters only.
+        digested = dict(same, digests={"a": "x", "b": "y"})
+        self.assertEqual(agent_lane._workspace_writes(self.workdir, before, digested),
+                         (0, None))
 
     def test_status_failure_is_unknown_not_non_git(self):
         # Corrupt the index so git status fails with a non-128 error.

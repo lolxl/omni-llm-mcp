@@ -9,8 +9,12 @@ DEFAULT_TIMEOUT_S = 180
 BIG_CONTEXT_TIMEOUT_S = 240
 DEFAULT_MODELS_TIMEOUT_S = 120
 
+# Ruling retire-gpt-5-6-sol (2026-09-30): move GPT-5.6 Sol to GPT-6.1 Sol
+# on Codex; the Cursor route stays on GPT-5.6 Sol until Cursor offers GPT-6.
+SOL_CODEX_MODEL = "gpt-6.1-sol"
+SOL_CURSOR_MODEL = "gpt-5.6-sol"
 # Codex CLI (subscription-auth). Used when a `codex/<model>` name omits the model.
-DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_MODEL = SOL_CODEX_MODEL
 DEFAULT_CODEX_REASONING_EFFORT = "high"  # omitted consult/agent path still sends this
 
 # Public `effort` token. Omitted = backend default (codex consult/agent: high;
@@ -43,6 +47,7 @@ CURSOR_EFFORT_SLUGS = {
     "claude-fable-5-thinking": ("low", "medium", "high", "xhigh", "max"),
     "claude-fable-5-1": ("low", "medium", "high", "xhigh", "max"),
     "claude-fable-5-1-thinking": ("low", "medium", "high", "xhigh", "max"),
+    "claude-fable-5-2": ("low", "medium", "high", "xhigh", "max"),
     "claude-opus-4-7": ("low", "medium", "high", "xhigh", "max"),
     "claude-opus-4-7-thinking": ("low", "medium", "high", "xhigh", "max"),
     "claude-opus-4-8": ("low", "medium", "high", "xhigh", "max"),
@@ -160,19 +165,11 @@ def cursor_effort_slug(base, token, account_profile=None):
     base = str(base or "").strip()
     if token is None:
         return base, None
+    del account_profile
     tokens = CURSOR_EFFORT_SLUGS.get(base)
     if tokens is not None and token in tokens:
         return CURSOR_EFFORT_SLUG_OVERRIDES.get((base, token),
                                                 "%s-%s" % (base, token)), None
-    try:
-        from providers.model_catalog import cursor_effort_slug as catalog_slug
-        slug, error = catalog_slug(
-            base, token, account_profile,
-            legacy_overrides=CURSOR_EFFORT_SLUG_OVERRIDES)
-        if error is None:
-            return slug, None
-    except Exception:
-        pass
     if tokens is None:
         return None, {
             "ok": False,
@@ -238,10 +235,12 @@ DEFAULT_PI_MODEL = "anthropic/claude-sonnet-5"
 # explicitly (cursor/fable, cursor/sol, …). composer-2.5 is the docs default
 # for new Cursor CLI sessions (UNVERIFIED-LIVE on this host).
 DEFAULT_CURSOR_MODEL = "composer-2.5"
+# Current fable id. Alias lookup and both family seats read this one value.
+FABLE_MODEL = "claude-fable-5-2"
 # Exact (case-insensitive) remainder after stripping `cursor/`. Not a prefix.
 CURSOR_MODEL_ALIASES = {
-    "fable": "claude-fable-5-1",
-    "sol": "gpt-5.6-sol",
+    "fable": FABLE_MODEL,
+    "sol": SOL_CURSOR_MODEL,
 }
 # "Cursor Models" monthly pool stems (https://cursor.com/docs/account/pricing).
 # Remaining cursor/ ids bill as "Other Models"; auto is a router, not a pool.
@@ -250,8 +249,8 @@ CURSOR_MODELS_POOL_STEMS = ("composer-", "cursor-grok-")
 # Matched case-insensitively on the whole name after an `@effort` split;
 # `cursor/sol` is cursor's own alias, not a family.
 FAMILIES = {
-    "sol": (("codex", "gpt-5.6-sol"), ("cursor", "gpt-5.6-sol")),
-    "fable": (("claude", "claude-fable-5-1"), ("cursor", "claude-fable-5-1")),
+    "sol": (("codex", SOL_CODEX_MODEL), ("cursor", SOL_CURSOR_MODEL)),
+    "fable": (("claude", FABLE_MODEL), ("cursor", FABLE_MODEL)),
 }
 # Optional absolute path to the Cursor CLI. Never fall back to `agent`.
 ENV_CURSOR_BIN = "OMNI_LLM_CURSOR_BIN"

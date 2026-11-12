@@ -10,6 +10,25 @@ import unittest
 from unittest import mock
 
 from providers import grok_image_cli, kernel_sandbox
+from tests import offline_home
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 _STUB = r'''#!/usr/bin/python3
@@ -55,6 +74,10 @@ print("synthetic image fixture complete")
     "requires macOS Seatbelt and /usr/bin/python3",
 )
 class GrokImageHostFenceLiveTests(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_production_image_consumer_gets_scoped_home_access(self):
         protected_home = Path(kernel_sandbox.protected_home()).resolve()
         with tempfile.TemporaryDirectory(

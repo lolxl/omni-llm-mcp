@@ -29,6 +29,25 @@ from tests import offline_home
 _DARWIN_FENCE = kernel_sandbox.available()
 _SKIP_NO_FENCE = "sandbox-exec not available at /usr/bin/sandbox-exec"
 
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fence tests below admit ~/.claude.json and the login
+    # keychain by their real names, and the job lane starts a Python child
+    # (the job runner) that resolves the real home on its own. Point
+    # protected_home() at a synthetic home, in this process and in Python
+    # children, so a CLI session rewriting those files cannot flip a test.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -40,25 +59,30 @@ def _write_exec(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
 
-def _three_step_script():
-    return textwrap.dedent(
+def _three_step_script(canary="", escape=None):
+    # OMNI54_CANARY and OMNI54_ESCAPE are not on the fence child-env
+    # allowlist. Both paths are literals in the generated script. An
+    # omitted escape stays /tmp/omni54-<pid>.txt so the write is still a
+    # real path the fence must deny.
+    if escape is None:
+        escape = "/tmp/omni54-%d.txt" % os.getpid()
+    script = textwrap.dedent(
         """\
         #!/usr/bin/env python3
-        import os, sys
-        pid = os.getpid()
+        import sys
         rcs = []
         try:
             open("./inside.txt", "w", encoding="utf-8").write("INSIDE\\n")
             rcs.append(0)
         except OSError as exc:
             rcs.append(exc.errno)
-        escape = os.environ.get("OMNI54_ESCAPE", "/tmp/omni54-%d.txt" % pid)
+        escape = __ESCAPE__
         try:
             open(escape, "w", encoding="utf-8").write("ESCAPE\\n")
             rcs.append(0)
         except OSError as exc:
             rcs.append(exc.errno)
-        canary = os.environ.get("OMNI54_CANARY", "")
+        canary = __CANARY__
         try:
             data = open(canary, "r", encoding="utf-8").read()
             sys.stdout.write(data)
@@ -68,6 +92,8 @@ def _three_step_script():
         sys.stdout.write("RCS %d %d %d\\n" % tuple(rcs))
         """
     )
+    script = script.replace("__ESCAPE__", repr(escape), 1)
+    return script.replace("__CANARY__", repr(canary), 1)
 
 
 class _FakeRunCli:
@@ -116,6 +142,8 @@ class TestAgentFenceImports(unittest.TestCase):
 
 class TestAgentFenceHermetic(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.workdir = os.path.realpath(tempfile.mkdtemp(prefix="omni54_wd_"))
         self.bindir = os.path.realpath(tempfile.mkdtemp(prefix="omni54_bin_"))
         self.addCleanup(_rmtree, self.workdir)
@@ -890,6 +918,8 @@ class TestAgentFenceHermetic(unittest.TestCase):
 @unittest.skipUnless(_DARWIN_FENCE, _SKIP_NO_FENCE)
 class TestAgentFenceLive(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.workdir = os.path.realpath(tempfile.mkdtemp(prefix="omni54_live_"))
         self.bindir = os.path.realpath(tempfile.mkdtemp(prefix="omni54_lbin_"))
         self.addCleanup(_rmtree, self.workdir)
@@ -909,16 +939,11 @@ class TestAgentFenceLive(unittest.TestCase):
             kernel_sandbox.ENV_CURSOR_BIN: os.environ.get(
                 kernel_sandbox.ENV_CURSOR_BIN
             ),
-            "OMNI54_CANARY": os.environ.get("OMNI54_CANARY"),
         }
         os.environ[kernel_sandbox.ENV_CLAUDE_BIN] = self.claude
         os.environ[kernel_sandbox.ENV_PI_BIN] = self.pi
         os.environ[kernel_sandbox.ENV_CURSOR_BIN] = self.cursor
-        if self.canary:
-            os.environ["OMNI54_CANARY"] = self.canary
         self.escape = "/tmp/omni54-%d.txt" % os.getpid()
-        os.environ["OMNI54_ESCAPE"] = self.escape
-        self.old_env["OMNI54_ESCAPE"] = None
         self.old_env[ENV_DEPTH] = os.environ.pop(ENV_DEPTH, None)
         self.addCleanup(self._restore_env)
         self.addCleanup(self._cleanup_escape)
@@ -963,7 +988,8 @@ class TestAgentFenceLive(unittest.TestCase):
             self.canary = _plant_home_canary()
         except OSError:
             self.skipTest("cannot plant home canary under protected_home()")
-        os.environ["OMNI54_CANARY"] = self.canary
+        for path in (self.claude, self.pi, self.cursor):
+            _write_exec(path, _three_step_script(self.canary, self.escape))
 
     def _assert_enforced(self, env, provider):
         self.assertTrue(env.get("ok"), env)
@@ -983,7 +1009,7 @@ class TestAgentFenceLive(unittest.TestCase):
         # RCS <inside> <escape> <home>
         self.assertGreaterEqual(len(parts), 4, text)
         self.assertEqual(parts[-2], "1", "escape write must be EPERM: %s" % text)
-        self.assertNotEqual(parts[-1], "0", "home read must not succeed: %s" % text)
+        self.assertEqual(parts[-1], "1", "home read must be EPERM: %s" % text)
         detail = env.get("fence_detail") or {}
         self.assertTrue(detail.get("read_wall"))
         self.assertTrue(detail.get("workdir_writable"))
@@ -2005,13 +2031,31 @@ class TestAgentFenceLive(unittest.TestCase):
 
 @unittest.skipUnless(_DARWIN_FENCE, _SKIP_NO_FENCE)
 class TestAgentFenceJobLane(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_i_job_json_planned_and_result_observed(self):
         root = tempfile.mkdtemp(prefix="omni54_job_")
         self.addCleanup(_rmtree, root)
         bindir = os.path.join(root, "bin")
         os.makedirs(bindir)
         fake = os.path.join(bindir, "claude")
-        _write_exec(fake, _three_step_script() + "\n")
+        canary = None
+        try:
+            canary = _plant_home_canary()
+        except OSError:
+            self.skipTest("cannot plant home canary")
+
+        def remove_canary():
+            if canary:
+                try:
+                    os.remove(canary)
+                except OSError:
+                    pass
+
+        self.addCleanup(remove_canary)
+        _write_exec(fake, _three_step_script(canary) + "\n")
         wd = os.path.join(root, "wd")
         os.makedirs(wd)
         import subprocess
@@ -2023,12 +2067,6 @@ class TestAgentFenceJobLane(unittest.TestCase):
         old_bin = os.environ.get(kernel_sandbox.ENV_CLAUDE_BIN)
         old_depth = os.environ.pop(ENV_DEPTH, None)
         os.environ[kernel_sandbox.ENV_CLAUDE_BIN] = fake
-        canary = None
-        try:
-            canary = _plant_home_canary()
-            os.environ["OMNI54_CANARY"] = canary
-        except OSError:
-            self.skipTest("cannot plant home canary")
         state = tempfile.mkdtemp(prefix="omni54_state_")
         self.addCleanup(_rmtree, state)
         old_state = os.environ.get("OMNI_LLM_STATE_DIR")
@@ -2043,12 +2081,6 @@ class TestAgentFenceJobLane(unittest.TestCase):
                 os.environ.pop("OMNI_LLM_STATE_DIR", None)
             else:
                 os.environ["OMNI_LLM_STATE_DIR"] = old_state
-            if canary:
-                try:
-                    os.remove(canary)
-                except OSError:
-                    pass
-            os.environ.pop("OMNI54_CANARY", None)
             if old_depth is None:
                 os.environ.pop(ENV_DEPTH, None)
             else:
@@ -2077,6 +2109,16 @@ class TestAgentFenceJobLane(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertNotEqual(result.get("reason"), "not_finished", result)
         self.assertEqual(result.get("fence"), "seatbelt-fs", result)
+        # The fenced child really ran its three steps (same reading as
+        # TestAgentFenceLive._assert_enforced: RCS <inside> <escape> <home>).
+        self.assertTrue(result.get("ok"), result)
+        text = result.get("text") or ""
+        self.assertNotIn("OMNI54_SECRET_CANARY", text)
+        parts = text.strip().split()
+        self.assertGreaterEqual(len(parts), 4, result)
+        self.assertEqual(parts[-4:-1], ["RCS", "0", "1"], result)
+        self.assertEqual(parts[-1], "1", "home read must be EPERM: %s" % text)
+        self.assertTrue((result.get("fence_detail") or {}).get("read_wall"), result)
 
     def test_j_cursor_job_lane_durable_config_dir_and_fence(self):
         root = tempfile.mkdtemp(prefix="omni54_cursor_job_")

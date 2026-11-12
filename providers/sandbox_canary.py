@@ -403,6 +403,11 @@ async def _run_vendor_readonly_probe(prompt, timeout_s) -> dict:
             "cli_missing",
             "codex not on PATH - install OpenAI Codex CLI, then `codex login`",
         )
+    from providers import admission
+    decision = admission.consider(
+        "codex", "default", DEFAULT_CODEX_MODEL, None, host_env=os.environ)
+    if decision.get("refusal"):
+        return _refusal("not_admitted", str(decision.get("refusal") or ""))
     tmp_cwd = None
     tmp_out = None
     try:
@@ -411,7 +416,20 @@ async def _run_vendor_readonly_probe(prompt, timeout_s) -> dict:
             suffix=".txt", prefix="omni_canary_out_",
         )
         os.close(out_fd)
-        argv = vendor_readonly_argv(exe, DEFAULT_CODEX_MODEL, tmp_out)
+        if isinstance(decision, dict) and decision.get("gate") == "catalog":
+            model = decision.get("model") or DEFAULT_CODEX_MODEL
+            effort = decision.get("effort")
+            argv = [
+                exe, "exec", "--json",
+                "--sandbox", "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral",
+            ]
+            if effort:
+                argv += ["-c", "model_reasoning_effort=%s" % effort]
+            argv += ["-m", model, "-o", tmp_out, "-"]
+        else:
+            argv = vendor_readonly_argv(exe, DEFAULT_CODEX_MODEL, tmp_out)
         if not is_vendor_readonly_argv(argv):
             return _refusal(
                 "canary_error",

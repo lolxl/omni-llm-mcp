@@ -13,6 +13,25 @@ from providers.errors import (
     signal_exit_detail,
     signal_name,
 )
+from tests import offline_home
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 _LOGIN_AGENT_TEXT = ("login credential " * 16).strip()
@@ -109,6 +128,10 @@ class SignalNameTest(unittest.TestCase):
 
 
 class CodexCallSiteClassificationTest(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_agent_message_login_with_skills_stderr_is_runtime_error(self):
         res = _codex_fail_envelope(_LOGIN_AGENT_STDOUT, _SKILLS_STDERR, 1)
         self.assertFalse(res.get("ok"), res)
@@ -139,6 +162,10 @@ class CodexFailureDetailTest(unittest.TestCase):
     _STDERR = (
         _PROMPT + " fix the auth bug\n"
         "2026-10-10T03:55:02.1Z ERROR codex_core::client: " + _PROMPT + " " + _KEY + "\n")
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def envelope(self, stdout, returncode=1, signal=None, stderr=None, prompt="hi"):
         """codex consult through run_cli, host fence passed through."""

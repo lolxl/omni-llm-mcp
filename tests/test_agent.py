@@ -44,6 +44,10 @@ from providers import agy as agy_mod  # noqa: E402
 from providers import pi as pi_mod  # noqa: E402
 from providers import sandbox_canary as sandbox_canary_mod  # noqa: E402
 from providers.route import resolve_route  # noqa: E402
+from tests import offline_home  # noqa: E402
+
+# Seeds v2 records; tests/offline_home.py gives this module the real gate.
+OMNI_TEST_REAL_ADMISSION = True
 
 _REAL_WHICH = shutil.which
 ENV_DEPTH_NAME = "OMNI_LLM_DEPTH"
@@ -67,21 +71,70 @@ HAS_CLI_AGENT = hasattr(omni_cli, "run_agent")
 
 _STATE_PATCH = None
 _STATE_DIR = None
+_HOME = None
+_WIDE = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _save_models(provider, models, efforts=None, profile="default"):
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    rows = []
+    for model in models:
+        item = {
+            "id": model,
+            "name": model,
+            "routable_id": "%s/%s" % (provider, model),
+        }
+        if efforts is not None:
+            item["supported_efforts"] = list(efforts)
+        rows.append(item)
+    record, _warnings = validate_strict(provider, {
+        "provider": provider,
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": rows,
+    })
+    catalog_v2.save(provider, profile, record)
+
+
+def _seed_agent_catalogs():
+    """Listed rows so argv tests reach the patched CLI instead of no_catalog."""
+    _save_models("codex", ["gpt-5.6-sol"], _WIDE)
+    _save_models("claude", ["sonnet", "opus"], _WIDE)
+    _save_models("grok", ["grok-4.5", "grok-4.6"])
+    _save_models("cursor", [
+        "composer-2.5",
+        "gpt-5.6-sol-xhigh",
+        "gpt-5.6-sol-medium",
+        "gpt-5.6-sol-high",
+    ])
 
 
 def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module. It goes
+    # first (and closes last): the state-dir patch below must not be scrubbed.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
     # #168: a write-mode run records a repository's protected branches under the
     # state dir. Keep these fixtures' repositories out of the real one.
     global _STATE_PATCH, _STATE_DIR
     _STATE_DIR = tempfile.mkdtemp(prefix="omni_state_")
     _STATE_PATCH = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": _STATE_DIR})
     _STATE_PATCH.start()
+    _seed_agent_catalogs()
 
 
 def tearDownModule():
     import shutil
-    _STATE_PATCH.stop()
-    shutil.rmtree(_STATE_DIR, ignore_errors=True)
+    try:
+        _STATE_PATCH.stop()
+        shutil.rmtree(_STATE_DIR, ignore_errors=True)
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 
@@ -262,6 +315,10 @@ class TestSpecUnitsExist(unittest.TestCase):
 # 1. config / route / backends snapshot
 # --------------------------------------------------------------------------- #
 class TestConfigAndRouting(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_agent_lane_constants(self):
         self.assertEqual(getattr(config_mod, "DEFAULT_AGENT_MODEL", None),
                          "grok-4.6")
@@ -389,6 +446,10 @@ class TestConfigAndRouting(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestRunAgentRefusals(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_recursion_guard_at_depth_1_or_higher(self):
         wd = self.mkdir()
         for value in ("1", "2", "7"):
@@ -416,12 +477,16 @@ class TestRunAgentRefusals(LaneTestCase):
 
     def test_unsupported_agent_for_non_agent_providers(self):
         wd = self.mkdir()
-        for model in ("gpt-4o", "ollama/x", "Gemini 3.5 Flash (High)"):
+        # agy is catalog-gated, so an unlisted name refuses before the agent check.
+        for model, reason in (
+                ("gpt-4o", "unsupported_agent"),
+                ("ollama/x", "unsupported_agent"),
+                ("Gemini 3.5 Flash (High)", "no_catalog")):
             with self.subTest(model=model):
                 fake = FakeRunCli()
                 with depth(None), patched_lane(fake):
                     env = self.run_agent(task="t", model=model, workdir=wd, timeout_s=30)
-                self.assertRefusal(env, "unsupported_agent")
+                self.assertRefusal(env, reason)
                 self.assertEqual(fake.calls, [],
                                  "refusal must precede any spawn")
 
@@ -452,6 +517,10 @@ class TestRunAgentRefusals(LaneTestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestWorkdirGitFence(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     @classmethod
     def setUpClass(cls):
         if not HAS_GIT:
@@ -517,6 +586,10 @@ class TestWorkdirGitFence(LaneTestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestCodexAgentCommand(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     @contextlib.contextmanager
     def verified_sandbox_record(self, version="0.148.0"):
         """Put the write-canary gate in its ALLOW state (issue #26)."""
@@ -532,6 +605,7 @@ class TestCodexAgentCommand(LaneTestCase):
         with mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": state_dir}), \
                 mock.patch.object(sandbox_canary_mod, "codex_cli_version",
                                   lambda: version):
+            _seed_agent_catalogs()
             yield
 
     def run_codex(self, **kwargs):
@@ -663,6 +737,10 @@ class TestCodexRunOkSemantics(LaneTestCase):
     stderr transcript, a command's output, a command's own argv, the agent's
     reply — and require ok:true from all of them.
     """
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def run_codex(self, stdout="", stderr="", reply="", **kwargs):
         wd = self.mkdir()
@@ -899,6 +977,10 @@ class TestCodexRunOkSemantics(LaneTestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestClaudeAgentCommand(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def run_claude(self, **kwargs):
         wd = self.mkdir()
         fake = FakeRunCli()
@@ -976,8 +1058,9 @@ class TestGrokAgentCommand(LaneTestCase):
         argv = fake.argv
         self.assertTrue(os.path.basename(argv[0]) == "grok", argv)
         self.assertFlagValue(argv, "--model", "grok-4.6")
-        # Omitted effort sends NO flag: the backend's own default applies.
-        self.assertLacksFlags(argv, "--reasoning-effort")
+        # The ruled vocabulary lists medium, so an omitted effort is sent.
+        self.assertFlagValue(argv, "--reasoning-effort", "medium")
+        self.assertEqual(env.get("effort_source"), "omni_default")
         self.assertTrue(env.get("ok"), env)
 
     def test_default_model_read_only_refuses_loudly(self):
@@ -1000,6 +1083,10 @@ class TestGrokAgentCommand(LaneTestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestPiAgentCommand(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def run_pi(self, **kwargs):
         wd = self.mkdir()
         fake = FakeRunCli()
@@ -1043,6 +1130,11 @@ class TestPiAgentCommand(LaneTestCase):
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestCursorAgentCommand(LaneTestCase):
     """Vendor argv on every platform; Darwin wrap rewrites --sandbox."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def run_cursor(self, model="cursor/composer-2.5", **kwargs):
         wd = self.mkdir()
         fake = FakeRunCli()
@@ -1122,20 +1214,17 @@ class TestCursorAgentCommand(LaneTestCase):
             }, None
         with mock.patch.dict(os.environ, {
                 "OMNI_LLM_CURSOR_CONFIG_DIR_WORK": profile_home,
-        }), mock.patch.object(cursor_mod, "resolve_model",
-                              return_value=("profile-family-high", None)) as resolve, \
-                mock.patch.object(agent_lane, "_workdir_fence", return_value=None), \
+        }), mock.patch.object(agent_lane, "_workdir_fence", return_value=None), \
                 mock.patch.object(agent_lane, "_apply_kernel_fence",
                                   side_effect=fake_fence), \
                 depth(None), patched_lane(fake):
+            _save_models("cursor", ["profile-family-high"], profile="work")
             env = self.run_agent(
                 task="DO THE THING", model="cursor/profile-family",
                 workdir=self.mkdir(), timeout_s=30, account_profile="work",
                 read_only=True,
                 effort="high")
         self.assertTrue(env.get("ok"), env)
-        self.assertEqual(resolve.call_args.args,
-                         ("profile-family", "high", "work"))
         self.assertFlagValue(fake.argv, "--model", "profile-family-high")
 
     def test_success_envelope_uses_json_result_field(self):
@@ -1176,6 +1265,10 @@ class TestCursorAgentCommand(LaneTestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(claude_mod is None, "providers/claude.py not implemented yet")
 class TestClaudeGenerateProvider(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def call(self, fake, depth_value=None, **kwargs):
         with depth(depth_value), \
                 mock.patch.object(claude_mod, "run_cli", fake), \
@@ -1244,6 +1337,11 @@ class TestClaudeGenerateProvider(LaneTestCase):
 @mock.patch("platform.system", new=lambda: "Linux")
 class TestGenerateProvidersPreferSignalField(unittest.TestCase):
     """Signal classification independent of macOS host-fence admission."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _which(self, name, *a, **kw):
         base = os.path.basename(str(name))
         if base in AGENT_CLIS or base in ("agy", "cursor-agent"):
@@ -1298,6 +1396,10 @@ class TestGenerateProvidersPreferSignalField(unittest.TestCase):
 # 7b. providers/pi.py — the GENERATE lane
 # --------------------------------------------------------------------------- #
 class TestPiGenerateProvider(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def call(self, fake, depth_value=None, **kwargs):
         with depth(depth_value), \
                 mock.patch.object(pi_mod, "run_cli", fake), \
@@ -1449,6 +1551,36 @@ class TestCliAgentMapping(unittest.TestCase):
             self.assertEqual(env["text_path"], path)
             self.assertEqual(env["text_bytes"], len(b"AGENT REPLY"))
 
+    def test_out_is_written_for_agent_failure_with_text(self):
+        failed = {"ok": False, "reason": "no_workspace_writes", "text": "REPORT",
+                  "model": "m", "workdir": "w", "duration_s": 1.0}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "reply.md")
+            code, out, _, _ = run_cli_main(
+                ["agent", "task", "--workdir", "/repo/wt", "--out", path], failed)
+            self.assertEqual(code, 1)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "REPORT")
+            env = json.loads(out)
+            self.assertIs(env["ok"], False)
+            self.assertEqual(env["reason"], "no_workspace_writes")
+            self.assertNotIn("text", env)
+            self.assertEqual(env["text_path"], path)
+            self.assertEqual(env["text_bytes"], len(b"REPORT"))
+
+    def test_out_is_not_written_for_gen_failure_with_text(self):
+        failed = {"ok": False, "reason": "empty_response", "text": "PARTIAL"}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "reply.txt")
+            stdout = io.StringIO()
+            with mock.patch.object(omni_cli, "_call", return_value=dict(failed)), \
+                    contextlib.redirect_stdout(stdout):
+                code = omni_cli.main(["gen", "hi", "--out", path])
+            self.assertEqual(code, 1)
+            self.assertFalse(os.path.exists(path))
+            env = json.loads(stdout.getvalue())
+            self.assertNotIn("text_path", env)
+
     def test_plain_prints_text_only_and_refusal_exits_1(self):
         code, out, _, _ = run_cli_main(
             ["agent", "task", "--workdir", "/repo/wt", "--plain"],
@@ -1469,6 +1601,10 @@ class TestCliAgentMapping(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 @unittest.skipIf(agent_lane is None, "providers/agent_lane.py not implemented yet")
 class TestReviewHardening(LaneTestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def call(self, model="codex/gpt-5.6-sol", fake=None, depth_value=None, **kwargs):
         fake = fake if fake is not None else FakeRunCli()
         with depth(depth_value), patched_lane(fake):

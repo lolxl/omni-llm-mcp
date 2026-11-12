@@ -34,9 +34,47 @@ import server
 from providers import (agy, artifacts, claude, cli_run, codex, cursor, errors, grok,
                        grok_image_cli, job_runner, jobs, known_secrets, logutil, pi)
 from tests.test_egress_redaction import Env, capture_cli, capture_server
+from tests import offline_home
 
 # No key-shaped prefix: only the known-value layer can catch these.
 PLAIN = "mZ4qT9vL" + "2xW7pR5n" + "K8dJ3hB6"
+
+
+def _seed_catalog(provider, model_id, efforts=None):
+    """A v2 row so the real gate reaches the vendor stub."""
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    item = {
+        "id": model_id,
+        "name": model_id,
+        "routable_id": "%s/%s" % (provider, model_id),
+    }
+    if efforts is not None:
+        item["supported_efforts"] = list(efforts)
+    record, _warnings = validate_strict(provider, {
+        "provider": provider,
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": [item],
+    })
+    catalog_v2.save(provider, "default", record)
+
+
+def _seed_grok_image():
+    """Image editing admits grok-4.7 before it registers a child environment."""
+    from providers.grok_image_cli import GROK_IMAGE_MODEL
+    _seed_catalog("grok", GROK_IMAGE_MODEL, ["medium"])
+
+
+def _seed_synthetic_lanes():
+    """Consult failure tests use the id ``synthetic`` on the real gate."""
+    medium = ["low", "medium", "high"]
+    _seed_catalog("claude", "synthetic", medium)
+    _seed_catalog("codex", "synthetic", medium)
+    _seed_catalog("grok", "synthetic", medium)
+    _seed_catalog("cursor", "synthetic")
+    _seed_catalog("agy", "synthetic")
 # Characters that change under JSON, URL and base64 encoding, and a multi-byte one.
 SPECIAL = 'aB3/xY9+kL2"qR7\\éTz5'
 FRAGMENT = 8
@@ -68,6 +106,24 @@ def forms(value):
 def fragments_of(blob, value):
     """Every spelling whose 8-char slice survives in blob."""
     return [name for name, text in forms(value).items() if leaked(blob, text)]
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 class Registry(unittest.TestCase):
@@ -577,9 +633,12 @@ class ProviderFailurePaths(FakeVendor, Env):
     )
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         # Env patches os.environ (cleared); FakeVendor makes the script.
         Env.setUp(self)
         FakeVendor.setUp(self)
+        _seed_synthetic_lanes()
 
     def binary_patches(self, mod):
         stack = contextlib.ExitStack()
@@ -731,12 +790,14 @@ class OtherExits(Registry):
     def test_grok_image_edit_registers_its_own_spawn(self):
         proc = mock.Mock(returncode=1, stdout="", stderr="denied for %s\n" % PLAIN)
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict(os.environ, {"XAI_API_KEY": PLAIN}), \
+                mock.patch.dict(os.environ, {
+                    "XAI_API_KEY": PLAIN, "OMNI_LLM_STATE_DIR": tmp}), \
                 mock.patch.object(grok_image_cli.shutil, "which", return_value="/bin/true"), \
                 mock.patch.object(grok_image_cli, "refuse_payload", return_value=None), \
                 mock.patch.object(grok_image_cli, "prepare_host_fence",
                                   side_effect=lambda argv, env, **kw: (argv, env, {})), \
                 mock.patch.object(grok_image_cli.subprocess, "run", return_value=proc):
+            _seed_grok_image()
             res = asyncio.run(grok_image_cli.run_grok_image_edit(
                 "p", os.path.join(tmp, "src.png"), out_dir=tmp))
         self.assertIs(res["ok"], False, res)
@@ -1065,6 +1126,8 @@ class NonUtf8Credential(Registry):
     VALUE = "abcdefgh\udc80ijklmnop\udcffqrstuvwx"
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         super().setUp()
         temp = tempfile.TemporaryDirectory(prefix="omni-171-")
         self.addCleanup(temp.cleanup)
@@ -1197,8 +1260,11 @@ class NonUtf8Credential(Registry):
         # change what the provider parses from the plain wire line.
         self.mixed_registry()
         binary = self.vendor_raw(self.WIRE.encode(), 0)
-        with mock.patch.dict(os.environ, {"CURSOR_API_KEY": PLAIN}), \
+        with mock.patch.dict(os.environ, {
+                    "CURSOR_API_KEY": PLAIN,
+                    "OMNI_LLM_STATE_DIR": self.root}), \
                 mock.patch.object(cursor, "resolve_bin", return_value=binary):
+            _seed_catalog("cursor", "synthetic")
             result = capture_server("cursor/synthetic")
         structured = result["structuredContent"]
         self.assertIs(structured.get("ok"), False, structured)
@@ -1212,10 +1278,12 @@ class NonUtf8Credential(Registry):
         src = os.path.join(self.root, "src.png")
         with open(src, "wb") as handle:
             handle.write(b"\x89PNG")
-        with mock.patch.object(grok_image_cli.vendor_bin, "which", return_value="/synthetic/grok"), \
+        with mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": self.root}), \
+                mock.patch.object(grok_image_cli.vendor_bin, "which", return_value="/synthetic/grok"), \
                 mock.patch.object(grok_image_cli, "prepare_host_fence",
                                   side_effect=lambda argv, **kw: (argv, dict(os.environ), {})), \
                 mock.patch.object(grok_image_cli.subprocess, "run", return_value=proc):
+            _seed_grok_image()
             result = asyncio.run(grok_image_cli.run_grok_image_edit(
                 "synthetic", src, 5, out_dir=self.root))
         self.assertIs(result.get("ok"), False, result)

@@ -59,7 +59,9 @@ from providers.profiles import (
     account_registry_scope,
 )
 from providers.route import resolve_route, provider_supports_files
-from providers.seat_name import is_agy_opus_alias, take_effort
+from providers.seat_name import retired_agy_opus, retired_model_error, take_effort
+from providers import admission
+from providers import provider_accounts
 from providers.source_load import resolve_big_context_source
 from providers import vendor_bin
 
@@ -780,8 +782,32 @@ def _provider_kwargs(effort):
     return {"effort": effort}
 
 
-async def route_to_provider(prompt, model, timeout_s, files, account_profile,
-                            effort=None, scrub_siblings=False):
+def _peel_request(model, effort):
+    """Logical model and effort after ``@`` resolution."""
+    return take_effort(model, effort)
+
+
+def _ring_managed(provider, profile):
+    return (provider in ("codex", "claude", "grok")
+            and _norm_seat_profile(profile) == "default"
+            and os.environ.get("OMNI_LLM_PROFILES_" + str(provider).upper()) is not None)
+
+
+def _attempt_isolated(provider, profile, scrub_siblings):
+    """Isolation the provider will apply, so the gate sees the same env."""
+    if scrub_siblings or _ring_managed(provider, profile):
+        return True
+    return provider_accounts.ring_pinned(provider, profile, False)
+
+
+def _consult_settings(provider, profile):
+    if provider != "claude":
+        return ()
+    return claude_mod.consult_settings_files(profile)
+
+
+async def _route_to_provider(prompt, model, timeout_s, files, account_profile,
+                             effort=None, scrub_siblings=False):
     """Pick a provider for ONE model via ROUTE_RULES and call it exactly once."""
     depth = env_depth()
     if depth >= 2:
@@ -789,7 +815,7 @@ async def route_to_provider(prompt, model, timeout_s, files, account_profile,
             "ok": False, "reason": "recursion_guard",
             "detail": "omni consultation refused at %s=%d (chain bound)"
                       % (ENV_DEPTH, depth)})
-    model, effort, split_err = take_effort(model, effort)
+    model, effort, split_err = _peel_request(model, effort)
     if split_err:
         return mark_local(dict(split_err))
     route = resolve_route(model)
@@ -807,22 +833,38 @@ async def route_to_provider(prompt, model, timeout_s, files, account_profile,
             ) % (model, provider),
         })
 
-    resolved, effort_err = effort_for_provider(provider, effort)
-    if effort_err:
-        return mark_local(dict(effort_err))
-    extra = _provider_kwargs(resolved)
-    if scrub_siblings and provider in RING_ROADS:
-        extra["scrub_siblings"] = True
-
     if provider in ("grok", "claude", "pi", "ollama", "lmstudio"):
         _overrides, profile_err = resolve_profile(provider, account_profile)
         if profile_err:
             return mark_local(dict(profile_err))
 
+    isolated = _attempt_isolated(provider, account_profile, scrub_siblings)
+    settings = _consult_settings(provider, account_profile)
+    mode = admission.gate(
+        provider, account_profile, isolated=isolated, host_env=os.environ,
+        settings_files=settings)
+    # Catalog attempts still admit inside the provider. The egress check
+    # stays here for every attempt, catalog or today, before that call.
+    if mode != "catalog":
+        resolved, effort_err = effort_for_provider(provider, effort)
+        if effort_err:
+            return mark_local(dict(effort_err))
+        extra = _provider_kwargs(resolved)
+    else:
+        extra = _provider_kwargs(effort)
     denied = refuse_payload(prompt)
     if denied:
         # omni's own egress gate refused: no vendor ran, so it cannot cool a seat.
+        if mode != "catalog":
+            decision = admission.consider(
+                provider, account_profile, routed_model, effort, isolated=isolated,
+                host_env=os.environ, settings_files=settings)
+            return mark_local(admission.stamp(
+                denied, decision,
+                sent_effort=admission.sent_effort(provider, decision, effort)))
         return mark_local(denied)
+    if scrub_siblings and provider in RING_ROADS:
+        extra["scrub_siblings"] = True
 
     if provider in ("ollama", "lmstudio", "openai"):
         if provider in ("ollama", "lmstudio"):
@@ -832,8 +874,13 @@ async def route_to_provider(prompt, model, timeout_s, files, account_profile,
             )
         else:
             api_base = route.get("default_api_base", "https://api.openai.com/v1")
-        return await openai_mod.run_openai_compatible(
+        result = await openai_mod.run_openai_compatible(
             prompt, routed_model, timeout_s, account_profile, api_base=api_base)
+        decision = admission.consider(
+            provider, account_profile, routed_model, effort, isolated=False,
+            host_env=os.environ, settings_files=())
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort(provider, decision, effort))
 
     if provider == "grok":
         # routed_model is the name AFTER a `grok/` prefix is stripped
@@ -847,27 +894,44 @@ async def route_to_provider(prompt, model, timeout_s, files, account_profile,
         # routed_model is the name AFTER the `codex/` prefix is stripped (what codex -m wants).
         # files: existing local paths handed to codex as repeated `-i` (native vision).
         return await codex_mod.run_codex_subprocess(
-            prompt, routed_model, timeout_s, account_profile, files=files, **extra)
+            prompt, routed_model, timeout_s, account_profile, files=files,
+            apply_aliases=True, **extra)
 
     if provider == "claude":
         # routed_model is the name AFTER the `claude/` prefix is stripped.
         return await claude_mod.run_claude_subprocess(
-            prompt, routed_model, timeout_s, account_profile, **extra)
+            prompt, routed_model, timeout_s, account_profile,
+            apply_aliases=True, **extra)
 
     if provider == "pi":
         # routed_model is the name AFTER the `pi/` prefix is stripped
-        # (what `pi --model` wants, e.g. xai/grok-4.6).
-        return await pi_mod.run_pi_subprocess(
+        # (what `pi --model` wants, e.g. xai/grok-4.6). pi is always today's gate.
+        result = await pi_mod.run_pi_subprocess(
             prompt, routed_model, timeout_s, account_profile, **extra)
+        decision = admission.consider(
+            "pi", account_profile, routed_model, effort, isolated=False,
+            host_env=os.environ, settings_files=())
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort("pi", decision, effort))
 
     if provider == "cursor":
         # routed_model is the name AFTER the `cursor/` prefix is stripped;
         # alias_model inside the provider expands fable/sol.
         return await cursor_mod.run_cursor_subprocess(
-            prompt, routed_model, timeout_s, account_profile, **extra)
+            prompt, routed_model, timeout_s, account_profile,
+            apply_aliases=True, **extra)
 
     return await agy_mod.run_agy(
         prompt, routed_model, timeout_s, files, account_profile, **extra)
+
+
+async def route_to_provider(prompt, model, timeout_s, files, account_profile,
+                            effort=None, scrub_siblings=False):
+    """One provider call. The result always carries the disclosure keys."""
+    result = await _route_to_provider(
+        prompt, model, timeout_s, files, account_profile,
+        effort=effort, scrub_siblings=scrub_siblings)
+    return admission.ensure_disclosure(result)
 
 
 def _chain_stops_after(provider, res):
@@ -890,7 +954,7 @@ def _chain_stops_after(provider, res):
 async def dispatch_single(prompt, model, timeout_s, files, account_profile,
                           effort=None, probing=False, scrub_siblings=False):
     """One model, with bounded backoff-retry on a transient rate_limit."""
-    model, effort, split_err = take_effort(model, effort)
+    model, effort, split_err = _peel_request(model, effort)
     if split_err:
         return split_err
     metrics_mod.note_seat_call(model)
@@ -1019,8 +1083,6 @@ def _expand_chain(chain, links, account_profile):
     for index, raw in enumerate(chain):
         bare, eff, err = links[index]
         if err:
-            if is_agy_opus_alias(raw):
-                return None, err
             seats.append({
                 "family": None,
                 "provider": None,
@@ -1040,14 +1102,15 @@ def _expand_chain(chain, links, account_profile):
                 seat["split_err"] = None
                 seats.append(seat)
             continue
-        seats.append({
+        seat = {
             "family": None,
             "provider": resolve_route(bare)["provider"],
             "model": bare,
             "account_profile": account_profile,
             "effort": eff,
             "split_err": None,
-        })
+        }
+        seats.append(seat)
     return seats, None
 
 
@@ -1103,23 +1166,40 @@ def _apply_profile_rings(seats, account_profile):
     return (seats if out is None else out), None
 
 
+def _seat_gate(seat):
+    """The gate this seat's provider attempt will see."""
+    provider = seat.get("provider")
+    profile = seat.get("account_profile")
+    isolated = bool(seat.get("scrub_siblings")) or _ring_managed(provider, profile)
+    return admission.gate(
+        provider, profile, isolated=isolated, host_env=os.environ,
+        settings_files=_consult_settings(provider, profile))
+
+
 def _classify_seat(seat, want_wall, snap):
-    """Return (kind, reason) where kind is ineligible / cooling / probing / healthy."""
+    """Return (kind, reason): ineligible, cooling, probing, or healthy.
+
+    Catalog admission is decided inside the provider. A catalog seat is
+    classified only by profile, health, and the read wall. A catalog refusal
+    on the provider result ends the walk.
+    """
     if seat.get("split_err"):
         return "ineligible", seat["split_err"].get("reason") or "unsupported_effort"
     provider = seat["provider"]
     profile = seat["account_profile"]
-    resolved, effort_err = effort_for_provider(provider, seat.get("effort"))
-    if effort_err:
-        return "ineligible", "unsupported_effort"
-    if provider == "cursor":
-        base = cursor_mod.alias_model(resolve_route(seat["model"])["model"])
-        _slug, slug_err = cursor_effort_slug(base, resolved, profile)
-        if slug_err:
-            return "ineligible", "unsupported_effort"
     _overrides, profile_err = resolve_profile(provider, profile)
     if profile_err:
         return "ineligible", "unsupported_profile"
+    mode = _seat_gate(seat)
+    if mode == "today":
+        resolved, effort_err = effort_for_provider(provider, seat.get("effort"))
+        if effort_err:
+            return "ineligible", "unsupported_effort"
+        if provider == "cursor":
+            base = cursor_mod.alias_model(resolve_route(seat["model"])["model"])
+            _slug, slug_err = cursor_effort_slug(base, resolved, profile)
+            if slug_err:
+                return "ineligible", "unsupported_effort"
     if want_wall:
         info = (snap or {}).get(provider) or {}
         if not info.get("read_wall"):
@@ -1142,16 +1222,26 @@ def _attach_seat(res, seat):
     return res
 
 
+def _retired_agy_chain(model):
+    """True when any comma-chain seat uses the retired ``agy-opus-*`` form."""
+    text = "" if model is None else str(model)
+    return any(retired_agy_opus(part) for part in text.split(","))
+
+
 async def _dispatch_llm_request(prompt, model, timeout_s, files, account_profile,
                                effort=None, require_read_wall=None):
     """OPT-IN FALLBACK: comma-separated model chain tried left-to-right.
 
     A family link expands to its ordered seats. Healthy seats dispatch first;
     cooling seats dispatch only after every healthy seat has failed;
-    ineligible seats are never dispatched.
+    ineligible seats are never dispatched. A retired ``agy-opus-*`` name
+    anywhere in the chain refuses before expansion, health maintenance,
+    or any seat.
     """
+    if _retired_agy_chain(model):
+        return retired_model_error()
     chain = [m.strip() for m in str(model).split(",") if m.strip()] or [DEFAULT_MODEL]
-    links = [take_effort(m, effort) for m in chain]
+    links = [_peel_request(m, effort) for m in chain]
     seats, cfg_err = _expand_chain(chain, links, account_profile)
     if cfg_err:
         return cfg_err
@@ -1180,9 +1270,10 @@ async def _dispatch_llm_request(prompt, model, timeout_s, files, account_profile
             info = (snap or {}).get(seat["provider"]) or {}
             if not info.get("read_wall"):
                 return _read_wall_required(seat)
+        kwargs = _provider_kwargs(seat.get("effort"))
         res = await dispatch_single(
             prompt, seat["model"], timeout_s, files,
-            seat["account_profile"], **_provider_kwargs(seat.get("effort")))
+            seat["account_profile"], **kwargs)
         return _attach_seat(res, seat)
 
     states = [_classify_seat(s, want_wall, snap) for s in seats]
@@ -1250,6 +1341,11 @@ async def _dispatch_llm_request(prompt, model, timeout_s, files, account_profile
                 inner = res.get("tried") if seat.get("provider") in ("codex", "claude", "grok") else []
                 res["tried"] = list(inner or []) + tried
             return _attach_seat(res, seat)
+        if res.get("reason") in admission.TERMINAL_CATALOG_REFUSALS:
+            if tried:
+                inner = res.get("tried") if seat.get("provider") in ("codex", "claude", "grok") else []
+                res["tried"] = list(inner or []) + tried
+            return res
         if managed_codex(seat) and res.get("reason") == "account_exhausted":
             exhausted_roads.add(seat["provider"])
         if _chain_stops_after(seat.get("provider"), res):
@@ -1278,6 +1374,11 @@ async def _dispatch_llm_request(prompt, model, timeout_s, files, account_profile
                 inner = res.get("tried") if seat.get("provider") in ("codex", "claude", "grok") else []
                 res["tried"] = list(inner or []) + tried
             return _attach_seat(res, seat)
+        if res.get("reason") in admission.TERMINAL_CATALOG_REFUSALS:
+            if tried:
+                inner = res.get("tried") if seat.get("provider") in ("codex", "claude", "grok") else []
+                res["tried"] = list(inner or []) + tried
+            return res
         if managed_codex(seat) and res.get("reason") == "account_exhausted":
             exhausted_roads.add(seat["provider"])
         if _chain_stops_after(seat.get("provider"), res):
@@ -1440,9 +1541,17 @@ def call_budget_s(name, args):
     return timeout_s * attempts + RATE_LIMIT_BACKOFF_S * (attempts - 1)
 
 
+_CONSULT_TOOLS = (
+    "llm_generate", "gemini_generate", "llm_big_context", "gemini_big_context",
+)
+
+
 async def call_tool(name, args):
     """One tool call -> envelope; the internal local-origin stamp never leaves."""
-    return strip_local_marker(await _call_tool_inner(name, args))
+    result = strip_local_marker(await _call_tool_inner(name, args))
+    if name in _CONSULT_TOOLS:
+        return admission.ensure_disclosure(result)
+    return result
 
 
 async def _call_tool_inner(name, args):
@@ -1567,7 +1676,17 @@ async def _call_tool_inner(name, args):
                     request_bytes=request_bytes, t0=t0)
             if backend == "cli":
                 # DEFAULT: keyless grok CLI image_edit (subscription) — edits source_image.
+                # The request model is not the CLI model. Admit the R11 id
+                # against the process-environment record before any spawn.
                 model = "grok-image-edit"
+                decision = admission.consider(
+                    "grok", "default", grok_image_cli_mod.GROK_IMAGE_MODEL, None,
+                    host_env=os.environ, apply_aliases=True, alias_image=True)
+                if decision.get("refusal"):
+                    res = admission.refusal_envelope("grok", "default", decision)
+                    return _finish_metrics(
+                        res, tool=name, model=model, account_profile=profile,
+                        request_bytes=request_bytes, t0=t0)
                 metrics_mod.note_seat_call(model)
                 res = await grok_image_cli_mod.run_grok_image_edit(
                     prompt,
@@ -1575,6 +1694,7 @@ async def _call_tool_inner(name, args):
                     timeout_s=args.get("timeout_s", DEFAULT_TIMEOUT_S),
                     out_dir=args.get("out_dir"),
                     account_profile=profile,
+                    apply_aliases=True,
                 )
                 metrics_mod.note_provider_attempt(model, "grok", res)
             else:
@@ -1606,6 +1726,7 @@ async def _call_tool_inner(name, args):
 async def dispatch_llm_request(prompt, model, timeout_s, files, account_profile,
                                effort=None, require_read_wall=None):
     with account_registry_scope():
-        return await _dispatch_llm_request(
+        result = await _dispatch_llm_request(
             prompt, model, timeout_s, files, account_profile,
             effort=effort, require_read_wall=require_read_wall)
+    return admission.ensure_disclosure(result)

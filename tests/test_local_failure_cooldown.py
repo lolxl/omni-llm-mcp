@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 
 from providers import claude, dispatch, errors, health
+from tests import offline_home
 
 MODEL = "claude/synthetic-model"
 PROFILE = "default"
@@ -29,6 +30,24 @@ MARKER = errors.LOCAL_ORIGIN_KEY
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Issue #223: the dispatch below builds the real claude fence, which
+    # admits ~/.claude.json and the login keychain by name. Point it at a
+    # synthetic home so a CLI session rewriting those cannot flip a test.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 class Env(unittest.TestCase):
@@ -44,6 +63,8 @@ class Env(unittest.TestCase):
         patch = mock.patch.object(health, "_account_identity", return_value=None)
         patch.start()
         self.addCleanup(patch.stop)
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def entry(self):
         return health.snapshot().get(health.pool_key(MODEL, PROFILE))
@@ -97,7 +118,12 @@ class TestLocalFailuresDoNotCool(Env):
         self.assertTrue(health.active(MODEL, PROFILE))
 
     def test_egress_gate_refusal_is_local(self):
-        denied = {"ok": False, "reason": "runtime_error", "detail": "egress refused"}
+        denied = {
+            "ok": False, "reason": "runtime_error", "detail": "egress refused",
+            "effort": None,
+            "effort_source": "today_gate",
+            "effort_note": "effort: (today's gate)",
+        }
         for _ in range(3):
             with mock.patch.object(dispatch, "refuse_payload", return_value=dict(denied)), \
                     mock.patch.object(claude, "run_cli", side_effect=AssertionError("spawned")):

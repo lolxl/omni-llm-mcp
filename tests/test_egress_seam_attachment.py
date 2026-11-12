@@ -28,6 +28,22 @@ if ROOT not in sys.path:
 from providers import claude as claude_mod
 from providers import codex as codex_mod
 from providers import dispatch as dispatch_mod
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 TW_MOBILE = "0912345678"
@@ -65,6 +81,10 @@ class TestCodexConsultAttachmentContentUngated(unittest.TestCase):
     `-i` paths are appended at lines 192-193. Server never reads file bytes
     (docstring at 149-151).
     """
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def test_codex_file_body_not_scanned_with_gate_on(self):
         # CURRENT-BEHAVIOR: consult `-i` file content is not gated.

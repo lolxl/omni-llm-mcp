@@ -41,9 +41,16 @@ credential inodes, which is the very read this guard forbids, and
 What a clean run guarantees: zero DETECTED accesses within the coverage
 described above. It does not prove that no real-home read happened.
 
+Abnormal exit: every synthetic home this process made is removed by an
+``atexit`` hook, so an uncaught exception, ``sys.exit`` or Ctrl-C leaves none
+behind (``SIGKILL``, ``os._exit`` and an unhandled ``SIGTERM`` skip ``atexit``
+and cannot be covered). Older ``omni_offline_home_*`` directories are never
+swept: another run may still be using them.
+
 ``violations()`` is empty for a clean run; the runner turns a non-empty list
 into a failing exit status and names the tests that touched the real home.
 """
+import atexit
 import json
 import os
 import pwd
@@ -76,6 +83,9 @@ ENV_HOME = "OMNI_OFFLINE_HOME"        # synthetic home, set for children
 ENV_REAL = "OMNI_OFFLINE_REAL_HOME"   # real home, set for children
 ENV_LOG = "OMNI_OFFLINE_HITLOG"       # append-only hit log shared with children
 ENV_CURRENT = "OMNI_OFFLINE_CURRENT"  # id of the running test
+# "1" when the running test's module sets OMNI_TEST_REAL_ADMISSION. A job
+# child has no test frame, so install_in_child reads this instead.
+ENV_REAL_ADMISSION = "OMNI_OFFLINE_REAL_ADMISSION"
 
 # Entries of the real home whose contents are credentials or live CLI state.
 # An ``open`` or listing of one of these is a violation even when it bypasses
@@ -154,7 +164,29 @@ _state = {
     "log": None,
     "owner": False,      # True in the process that called install()
     "made": [],          # every synthetic home created by this process
+    "atexit_pid": None,  # pid that registered the exit cleanup
 }
+
+
+def child_env(fake, real, log, environ=None):
+    """The variables that arm a Python child, as one dict.
+
+    ``sitecustomize`` in ``SITE_DIR`` runs ``install_in_child()`` in every
+    interpreter that finds it on ``PYTHONPATH``; ROOT must be there too,
+    because ``sitecustomize`` imports ``tests.offline_home``. Entries the
+    environment already had stay after those two. ``install()`` and the
+    direct-mode ``use_synthetic_home()`` both build their children's
+    environment here.
+    """
+    environ = os.environ if environ is None else environ
+    return {
+        ENV_HOME: fake,
+        ENV_REAL: real,
+        ENV_LOG: log,
+        "PYTHONPATH": os.pathsep.join(
+            [SITE_DIR, ROOT] + [p for p in environ.get(
+                "PYTHONPATH", "").split(os.pathsep) if p]),
+    }
 
 
 def real_home():
@@ -327,26 +359,68 @@ def record(how, raw, real=None):
     return rel
 
 
+def _module_wants_real_admission(test_id):
+    """True when *test_id*'s module set ``OMNI_TEST_REAL_ADMISSION``.
+
+    ``test.id()`` is ``module.Class.method``. Walk toward the module and
+    read it from ``sys.modules``; a name that is not loaded is not a module.
+    """
+    name = test_id
+    while name:
+        mod = sys.modules.get(name)
+        if mod is not None and mod.__dict__.get("OMNI_TEST_REAL_ADMISSION") is True:
+            return True
+        if "." not in name:
+            return False
+        name = name.rsplit(".", 1)[0]
+    return False
+
+
 def set_current(test_id):
     _state["current"] = test_id
     if test_id is None:
         os.environ.pop(ENV_CURRENT, None)
+        os.environ.pop(ENV_REAL_ADMISSION, None)
+        return
+    os.environ[ENV_CURRENT] = test_id
+    if _module_wants_real_admission(test_id):
+        os.environ[ENV_REAL_ADMISSION] = "1"
     else:
-        os.environ[ENV_CURRENT] = test_id
+        os.environ.pop(ENV_REAL_ADMISSION, None)
+
+
+def read_log(path):
+    """The rows the children wrote to the hit log at *path*.
+
+    Each is ``(test id, "child:" + how, detail)``. A line that is not a
+    four-item JSON row is not skipped: it comes back as a
+    ``child:log_malformed`` row carrying the start of the line, so a damaged
+    log fails the run instead of hiding what was in it.
+    """
+    rows = []
+    if not path or not os.path.exists(path):
+        return rows
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                t, how, rel, _pid = json.loads(line)
+                if not (isinstance(how, str) and isinstance(rel, str)
+                        and (t is None or isinstance(t, str))):
+                    raise ValueError("unexpected field types")
+            except (ValueError, TypeError):
+                rows.append((None, "child:log_malformed", line.strip()[:200]))
+                continue
+            rows.append((t, "child:" + how, rel))
+    return rows
 
 
 def violations():
     """Hits from this process and from the children that logged to the file."""
     rows = list(_state["hits"])
-    log = _state["log"]
-    if _state["owner"] and log and os.path.exists(log):
-        with open(log, encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    t, how, rel, _pid = json.loads(line)
-                except ValueError:
-                    continue
-                rows.append((t, "child:" + how, rel))
+    if _state["owner"]:
+        rows.extend(read_log(_state["log"]))
     return rows
 
 
@@ -363,6 +437,21 @@ def _audit(event, args):
     rel = _classify(target)
     if rel is not None and _sensitive(rel):
         _add_hit("list" if event != "open" else "open", rel)
+
+
+def _remove_made_at_exit():
+    """Exit hook: remove the homes this process made and still has."""
+    if _state["atexit_pid"] != os.getpid():   # a forked child is not the owner
+        return
+    for made in list(_state["made"]):
+        if os.path.lexists(made):
+            shutil.rmtree(made, ignore_errors=True)
+
+
+def _register_exit_cleanup():
+    if _state["atexit_pid"] is None:
+        _state["atexit_pid"] = os.getpid()
+        atexit.register(_remove_made_at_exit)
 
 
 def _make_home(real):
@@ -384,6 +473,7 @@ def _make_home(real):
         if _under(base, real) or any(_under(base, t) for t in temp_like):
             tried.append(base)
             continue
+        _register_exit_cleanup()
         made = os.path.realpath(
             tempfile.mkdtemp(prefix="omni_offline_home_", dir=base))
         _state["made"].append(made)
@@ -437,6 +527,180 @@ def make_home(real=None):
     return root
 
 
+class SyntheticHome:
+    """Handle returned by ``use_synthetic_home``: the home and what it saw."""
+
+    def __init__(self, home, real, wrapper=None, log=None):
+        self.home = home
+        self.real = real
+        # Direct mode: the hit log Python children append to (under ``home``).
+        # None under the runner, which owns and reports its own log.
+        self.log = log
+        self.admitted = []   # every path admit_path resolved, in order
+        self._mark = 0       # position in ``admitted`` where the last test began
+        self._wrapper = wrapper   # the admit_path this handle installed
+        self._undo = None
+
+    def mark(self):
+        """Start blaming from here: call it in setUp, before assert_hermetic.
+
+        ``assert_hermetic`` then reports only the admissions made after the
+        last mark, so a real-home admission in one test does not fail the
+        next one. It also fails loudly when ``kernel_sandbox.admit_path`` is
+        no longer this handle's wrapper (another patch replaced or stopped
+        it): the recorder would see nothing and every check would pass for
+        nothing. A test that never reaches the fence is fine; a wrapper that
+        is gone is not.
+        """
+        if self._wrapper is not None and kernel_sandbox.admit_path is not self._wrapper:
+            raise AssertionError(
+                "kernel_sandbox.admit_path is not the synthetic-home recorder: "
+                "the patch was replaced or stopped, so assert_hermetic would "
+                "check nothing")
+        self._mark = len(self.admitted)
+
+    def close(self):
+        """Undo the patches and remove the synthetic home (idempotent).
+
+        It does not judge the record: an empty one is legitimate, since many
+        tests never reach the fence. Whether the recorder is still
+        installed is checked by ``mark()``; whether anything resolved under
+        the real home is checked by ``assert_module_hermetic()``, which a
+        module calls before this.
+        """
+        undo, self._undo = self._undo, None
+        if undo:
+            undo()
+
+    def real_home_admissions(self):
+        """Admitted paths since the last ``mark()`` at or under the real home."""
+        return [p for p in self.admitted[self._mark:] if _under(p, self.real)]
+
+    def assert_hermetic(self, case):
+        """Fail *case* if the fence admitted anything under the real home."""
+        case.assertEqual(self.real_home_admissions(), [],
+                         "the fence admitted paths under the real home")
+
+    def child_rows(self):
+        """What Python children logged to this handle's hit log, in order.
+
+        Empty when the handle has no log (under the runner). A row that cannot
+        be read comes back as a ``child:log_malformed`` row.
+        """
+        return read_log(self.log)
+
+    def assert_module_hermetic(self):
+        """Fail if any admission since this handle was created, marked or not,
+        resolved at or under the real home, or if a Python child logged
+        anything to this handle's hit log (a real-home hit, an ``arm_failed``
+        row, an unreadable row). Call it from ``tearDownModule`` before
+        ``close()`` so classes without a ``mark()`` are covered too.
+        """
+        bad = [p for p in self.admitted if _under(p, self.real)]
+        rows = self.child_rows()
+        problems = []
+        if bad:
+            problems.append(
+                "the fence admitted paths under the real home during this "
+                "module: %s" % (bad,))
+        if rows:
+            problems.append(
+                "Python children reported to the hit log during this "
+                "module:\n%s" % format_violations(rows))
+        if problems:
+            raise AssertionError("\n".join(problems))
+
+
+def use_synthetic_home(real=None):
+    """Keep one test module off the real home when the runner is not used.
+
+    ``tests/run_offline_tests.py`` arms ``install()`` for the whole run. A
+    module run directly (``python3 -m unittest tests.test_x``) has no such
+    guard, so its fenced spawns admit ``~/.claude.json`` and the login keychain
+    by their real names, and a CLI session rewriting them between admission
+    and profile build makes the fence refuse (``fence_path_rejected``). Call
+    this from ``setUpModule`` and call ``close()`` from ``tearDownModule``
+    (``addModuleCleanup`` is not used: before Python 3.10 it runs only when the
+    module defines ``tearDownModule``): ``protected_home()`` and ``$HOME``
+    point at a populated synthetic home, every admission is recorded, and the
+    returned handle reports any that still resolved under the real home. The
+    fence's admission-vs-build check itself is untouched.
+
+    *real* names the home to keep away from; it defaults to the passwd home
+    and is overridden only by the guard's own tests (as in ``install(real=)``).
+
+    Not armed: account variables (``CLAUDE_CONFIG_DIR``, ``CODEX_HOME``, ...)
+    are cleared and ``XDG_*`` points into the synthetic home, as under the
+    runner. Everything is restored by ``close()``. The home is also removed at
+    interpreter exit if ``close()`` never ran (see the module docstring).
+
+    Python children are armed the way the runner arms them: the environment
+    carries ``OMNI_OFFLINE_HOME``, ``OMNI_OFFLINE_REAL_HOME``,
+    ``OMNI_OFFLINE_HITLOG`` and a ``PYTHONPATH`` that leads to
+    ``tests/offline_home_site/sitecustomize.py`` (the job runner is one such
+    child). Their hits go to a log under the synthetic home, and
+    ``assert_module_hermetic()`` fails on any row in it. These variables are
+    set inside the same ``os.environ`` snapshot as ``HOME``, so ``close()``
+    restores them exactly, including ones that were unset.
+
+    Limits, all of them fail-open (the same residual the runner has):
+
+    * a child started with ``-I``, ``-S`` or ``-E``, one whose ``PYTHONPATH``
+      is replaced or whose environment is cleared, and one whose environment
+      is filtered by the host-fence allowlist (``providers/host_fence.py``)
+      does not arm;
+    * child rows carry no test id (nothing calls ``set_current`` here);
+    * a row written after ``assert_module_hermetic()`` read the log, for
+      example by a detached job runner that outlives the module, is lost;
+    * the parent records admissions only; a child also records sensitive
+      opens and listings under the real home through the audit hook.
+
+    Under the runner the guard is already armed: nothing is changed and
+    nothing new is exported, and the runner's own log is not read here (the
+    runner reports it), but the admissions are still recorded so the same
+    assertion works in both modes. Call ``mark()`` from ``setUp`` before
+    registering ``assert_hermetic``, and ``assert_module_hermetic()`` then
+    ``close()`` (in a ``try/finally``) from ``tearDownModule``.
+    """
+    real = os.path.realpath(real) if real else real_home()
+    armed = _state["armed"]
+    fake = _state["home"] if armed else make_home(real)
+    log = None if armed else os.path.join(fake, ".offline-hits.jsonl")
+    handle = SyntheticHome(fake, real, log=log)
+    real_admit = kernel_sandbox.admit_path
+
+    def admit_path(raw, kind, *, label):
+        ap = real_admit(raw, kind, label=label)
+        handle.admitted.append(ap.path)
+        return ap
+
+    handle._wrapper = admit_path
+    patches = [mock.patch.object(kernel_sandbox, "admit_path", admit_path)]
+    if not armed:
+        patches += [
+            mock.patch.object(kernel_sandbox, "protected_home", lambda: fake),
+            mock.patch.dict(os.environ, {"HOME": fake,
+                                         **child_env(fake, real, log)}),
+        ]
+    for p in patches:
+        p.start()
+    if not armed:
+        # Direct mode: the same account-variable scrub the runner applies. The
+        # dict patch above restores every variable on close().
+        _scrub_env(os.environ, fake)
+
+    def undo():
+        for p in reversed(patches):
+            p.stop()
+        if not armed:
+            if fake in _state["made"]:
+                _state["made"].remove(fake)
+            shutil.rmtree(fake, ignore_errors=True)
+
+    handle._undo = undo
+    return handle
+
+
 def _scrub_env(environ, fake, only_real=False):
     """Clear or redirect the variables that can name real account state.
 
@@ -462,6 +726,29 @@ def _scrub_env(environ, fake, only_real=False):
         environ["XDG_CACHE_HOME"] = os.path.join(fake, ".cache")
 
 
+def _patch_admission_gate():
+    """Keep modules written before admission on today's gate.
+
+    ``admission.gate`` answers ``"today"`` unless ``OMNI_OFFLINE_REAL_ADMISSION``
+    is ``"1"``. ``set_current()`` sets it while a test from a module with
+    ``OMNI_TEST_REAL_ADMISSION = True`` runs; those modules seed v2 records.
+    The variable reaches Python children, so the runner process, its threads
+    and its children decide the same way. The real gate's return value is
+    passed through unchanged.
+    """
+    from providers import admission
+    real_gate = admission.gate
+
+    def gate(*args, **kwargs):
+        if os.environ.get(ENV_REAL_ADMISSION) == "1":
+            return real_gate(*args, **kwargs)
+        return "today"
+
+    patch = mock.patch.object(admission, "gate", gate)
+    patch.start()
+    return patch
+
+
 def install(real=None):
     """Arm the synthetic home and the real-home recorder for this process.
 
@@ -477,17 +764,11 @@ def install(real=None):
     _state.update(real=real, ident=_identity(real), home=fake,
                   hits=[], current=None, armed=True, owner=True, log=log)
     patches = _patch_kernel_sandbox(fake, real)
-    env = mock.patch.dict(os.environ, {
-        "HOME": fake,
-        ENV_HOME: fake,
-        ENV_REAL: real,
-        ENV_LOG: log,
-        "PYTHONPATH": os.pathsep.join(
-            [SITE_DIR, ROOT] + [p for p in os.environ.get(
-                "PYTHONPATH", "").split(os.pathsep) if p]),
-    })
+    env = mock.patch.dict(os.environ, {"HOME": fake,
+                                       **child_env(fake, real, log)})
     env.start()
     patches.append(env)
+    patches.append(_patch_admission_gate())
     _scrub_env(os.environ, fake)
     _state["patches"] = patches
     if not _state["hook"]:
@@ -514,6 +795,7 @@ def install_in_child():
     _scrub_env(os.environ, fake, only_real=True)
     if kernel_sandbox.protected_home() != fake:
         raise RuntimeError("protected_home was not redirected")
+    _state.setdefault("patches", []).append(_patch_admission_gate())
 
 
 def report_arm_failure(reason, log=None, test_id=None):
@@ -569,6 +851,9 @@ def format_violations(hits=None):
     for test_id, how, rel in hits:
         if how.endswith("arm_failed"):
             lines.append("  %s: a child could not arm the guard: %s"
+                         % (test_id, rel))
+        elif how.endswith("log_malformed"):
+            lines.append("  %s: unreadable row in the child hit log: %s"
                          % (test_id, rel))
         else:
             lines.append("  %s: %s -> ~/%s" % (test_id, how, rel))

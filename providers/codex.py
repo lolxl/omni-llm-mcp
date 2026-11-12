@@ -65,7 +65,8 @@ from providers import vendor_bin
 async def _run_codex_once(prompt, model, timeout_s, account_profile="default",
                                reasoning_effort=DEFAULT_CODEX_REASONING_EFFORT,
                                files=None, effort=None, scrub_siblings=False,
-                               account_home=None, account_deadline=None, _spawn=None):
+                               account_home=None, account_deadline=None, _spawn=None,
+                               admitted=False):
     """Pipe prompt -> `codex exec` (non-interactive) -> typed envelope.
 
     Rides the local ChatGPT/Codex CLI login (subscription auth, no API key), the
@@ -128,9 +129,12 @@ async def _run_codex_once(prompt, model, timeout_s, account_profile="default",
         timeout_s = DEFAULT_TIMEOUT_S
 
     model = str(model) or DEFAULT_CODEX_MODEL
-    if effort is not None and str(effort).strip():
-        reasoning_effort = effort
-    effort = str(reasoning_effort or DEFAULT_CODEX_REASONING_EFFORT)
+    if admitted:
+        chosen = str(effort).strip() if effort is not None and str(effort).strip() else None
+    else:
+        if effort is not None and str(effort).strip():
+            reasoning_effort = effort
+        chosen = str(reasoning_effort or DEFAULT_CODEX_REASONING_EFFORT)
     tmp_cwd = None
     tmp_out = None
     try:
@@ -146,12 +150,9 @@ async def _run_codex_once(prompt, model, timeout_s, account_profile="default",
         ]
         for f in files:
             argv += ["-i", f]
-        argv += [
-            "-c", "model_reasoning_effort=%s" % effort,
-            "-m", model,
-            "-o", tmp_out,
-            "-",
-        ]
+        if chosen is not None:
+            argv += ["-c", "model_reasoning_effort=%s" % chosen]
+        argv += ["-m", model, "-o", tmp_out, "-"]
 
         # Kernel Seatbelt fence (issue #45 consult read wall + #26 write wall).
         # verify+apply is one fail-closed operation; never spawn unfenced when
@@ -386,7 +387,9 @@ async def _run_codex_once(prompt, model, timeout_s, account_profile="default",
 @local_request_before_spawn(unstamped_reasons=("timeout",))
 async def run_codex_subprocess(prompt, model, timeout_s, account_profile="default",
                                reasoning_effort=DEFAULT_CODEX_REASONING_EFFORT,
-                               files=None, effort=None, scrub_siblings=False, account_pinned=False):
+                               files=None, effort=None, scrub_siblings=False, account_pinned=False,
+                               apply_aliases=False):
+    from providers import admission
     selection = codex_accounts.AccountSelection(account_profile, "codex/" + str(model), timeout_s, resume=account_pinned)
     if selection.error:
         return selection.exhausted()
@@ -394,12 +397,20 @@ async def run_codex_subprocess(prompt, model, timeout_s, account_profile="defaul
         ring_pin = provider_accounts.ring_pinned("codex", account_profile, account_pinned)
         scrub_siblings = scrub_siblings or ring_pin
         want_pin = ring_pin or (account_pinned and scrub_siblings)
+        isolated = bool(scrub_siblings or want_pin)
+        decision = admission.consider(
+            "codex", account_profile, model, effort, isolated=isolated,
+            host_env=os.environ, settings_files=(), apply_aliases=apply_aliases)
+        if admission.is_terminal(decision):
+            return admission.refusal_envelope("codex", account_profile, decision)
+        run_model, run_effort, catalog = admission.bound_call(model, effort, decision)
         pin = selection.next() if want_pin else None
         if want_pin and pin is None:
             return selection.exhausted()
         started = time.time()
-        result = await _run_codex_once(prompt, model, timeout_s, account_profile,
-                                      reasoning_effort, files, effort, scrub_siblings,
+        result = await _run_codex_once(prompt, run_model, timeout_s, account_profile,
+                                      reasoning_effort, files, run_effort, scrub_siblings,
+                                      admitted=catalog,
                                       **({"account_home": pin["codex_home"],
                                           "account_deadline": selection.deadline} if pin else {}))
         if result.get("ok"):
@@ -418,10 +429,22 @@ async def run_codex_subprocess(prompt, model, timeout_s, account_profile="defaul
             # Quota/auth/account failures cool the account so the next request
             # selects another; any other reason only follows the crash streak.
             selection.failed({"account_profile": account_profile or "default"}, result)
-        return result
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort("codex", decision, effort))
+    holder = admission.install_ring_skip(selection, lambda account: admission.consider(
+        "codex", account.get("account_profile"), model, effort, isolated=True,
+        host_env=os.environ, settings_files=(), apply_aliases=apply_aliases))
+
     async def attempt(account, remaining, managed):
-        return await _run_codex_once(
-            prompt, model, remaining, account["account_profile"],
-            reasoning_effort, files, effort, True,
+        decision = account.get("_admission")
+        run_model, run_effort, catalog = admission.bound_call(model, effort, decision)
+        result = await _run_codex_once(
+            prompt, run_model, remaining, account["account_profile"],
+            reasoning_effort, files, run_effort, True, admitted=catalog,
             account_home=account["codex_home"], account_deadline=selection.deadline)
-    return await codex_accounts.run_selected(selection, attempt)
+        return admission.stamp(
+            result, decision, sent_effort=admission.sent_effort("codex", decision, effort))
+
+    result = await codex_accounts.run_selected(selection, attempt)
+    replaced = admission.ring_exhausted("codex", result, holder)
+    return replaced if replaced is not None else result

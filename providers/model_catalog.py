@@ -1,7 +1,7 @@
 """Local, attributable model catalogs and metadata-only refresh adapters.
 
-Catalog state is scoped to a provider profile, never changes model defaults,
-and is used only as additive metadata by Cursor effort resolution.
+Catalog state is scoped to a provider profile and never changes model defaults.
+Refresh writes a v2 record. Status, check, and admit read that record.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import secrets
 import selectors
@@ -28,7 +29,6 @@ from urllib.parse import parse_qsl, urlsplit
 from providers import vendor_bin
 
 
-SCHEMA_VERSION = 1
 PROVIDERS = ("cursor", "agy", "codex", "claude", "grok")
 ROAD_PREFIX = {name: name + "/" for name in PROVIDERS}
 EFFORTS = frozenset(("minimal", "low", "medium", "high", "xhigh", "max", "ultra"))
@@ -40,7 +40,24 @@ MAX_MODEL_COUNT = 5000
 MAX_CODEX_PAGES = 100
 CODEX_RPC_METHODS = frozenset(("initialize", "initialized", "model/list"))
 CODEX_SAFE_NOTIFICATIONS = frozenset(("remoteControl/status/changed",))
+_POSTURE_SEATBELT = "seatbelt-fs"
+_POSTURE_UNFENCED = "metadata-unfenced"
+_DISCOVERY_POSTURES = (_POSTURE_SEATBELT, _POSTURE_UNFENCED)
+# Off Darwin, refresh discovery may spawn only these argv tails, and only when
+# argv[0] realpath-matches the binary that provider's discoverer looks up.
+# Claude's full argv is _claude_discovery_argv. Any other argv is refused
+# before a child starts.
+_METADATA_ARGV_TAILS = {
+    "cursor": ("--list-models",),
+    "agy": ("models",),
+    "grok": ("models",),
+    "codex": ("app-server",),
+}
 _ACTIVE_PROFILE = contextvars.ContextVar("omni_catalog_profile", default="default")
+# Raw vendor output from the fetch that the current refresh is parsing.
+# A patched discoverer leaves this unset, so refresh validates that return
+# value instead of reparsing vendor output.
+_FETCHED_OUTPUT = contextvars.ContextVar("omni_catalog_fetched_output", default=None)
 _ID_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
 _EFFORT_SUFFIXES = (
     ("extra-high", "xhigh"), ("minimal", "minimal"), ("medium", "medium"),
@@ -313,16 +330,6 @@ def _scope_fingerprint(provider, profile, create=False):
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hmac.new(_identity_key(root, create=create), payload, hashlib.sha256).hexdigest()[:32]
 
-
-def _cache_paths(provider, profile, create=False):
-    if provider not in PROVIDERS:
-        raise CatalogError("unknown_provider", provider)
-    root = _catalog_root(create=create)
-    fingerprint = _scope_fingerprint(provider, profile, create=create)
-    stem = "%s-%s" % (provider, fingerprint)
-    return root / (stem + ".json"), root / (stem + ".status.json"), root / (stem + ".lock")
-
-
 def _atomic_write(path, data, mode=0o600):
     parent = path.parent
     if path.is_symlink() or parent.is_symlink() or not parent.is_dir():
@@ -372,282 +379,34 @@ def _json_loads(data):
         return result
     return json.loads(data, object_pairs_hook=reject_duplicates)
 
-
-def validate_record(provider, value, *, allow_manual_timestamp=True):
-    if provider not in PROVIDERS or not isinstance(value, dict):
-        raise CatalogError("schema_invalid", provider)
-    source = value.get("source")
-    if source not in ("live", "bundled", "manual"):
-        raise CatalogError("schema_invalid", provider)
-    observed_at = value.get("observed_at")
-    if observed_at is not None and _utc_datetime(observed_at) is None:
-        raise CatalogError("timestamp_invalid", provider)
-    if observed_at is None and source != "manual" and not allow_manual_timestamp:
-        raise CatalogError("timestamp_missing", provider)
-    if source != "manual" and observed_at is None:
-        raise CatalogError("timestamp_missing", provider)
-    version = value.get("cli_version")
-    if version is not None and (not isinstance(version, str) or len(version) > 100):
-        raise CatalogError("schema_invalid", provider)
-    availability = value.get("availability")
-    if availability not in ("provider_advertised", "unknown"):
-        raise CatalogError("schema_invalid", provider)
-    models = value.get("models")
-    if not isinstance(models, list) or not models or len(models) > MAX_MODEL_COUNT:
-        raise CatalogError("model_list_invalid", provider)
-    normalized = []
-    seen = set()
-    for item in models:
-        if not isinstance(item, dict):
-            raise CatalogError("model_entry_invalid", provider)
-        model_id = item.get("id")
-        if not isinstance(model_id, str) or not _ID_RE.fullmatch(model_id):
-            raise CatalogError("model_id_invalid", provider)
-        if model_id in seen:
-            raise CatalogError("duplicate_model_id", provider)
-        seen.add(model_id)
-        name = item.get("name", model_id)
-        if not isinstance(name, str) or not _ID_RE.fullmatch(name):
-            raise CatalogError("model_name_invalid", provider)
-        routable_id = item.get("routable_id", ROAD_PREFIX[provider] + model_id)
-        if routable_id != ROAD_PREFIX[provider] + model_id:
-            raise CatalogError("routable_id_invalid", provider)
-        efforts = item.get("supported_efforts", [])
-        if not isinstance(efforts, list) or any(e not in EFFORTS for e in efforts):
-            raise CatalogError("effort_metadata_invalid", provider)
-        efforts = sorted(set(efforts), key=lambda e: ("minimal", "low", "medium", "high", "xhigh", "max", "ultra").index(e))
-        default_effort = item.get("default_effort")
-        if default_effort is not None and default_effort not in efforts:
-            raise CatalogError("effort_metadata_invalid", provider)
-        effort_known = item.get("efforts_known", bool(efforts))
-        if not isinstance(effort_known, bool) or (efforts and not effort_known):
-            raise CatalogError("effort_metadata_invalid", provider)
-        row = {"id": model_id, "name": name, "routable_id": routable_id,
-               "supported_efforts": efforts, "efforts_known": effort_known}
-        if default_effort is not None:
-            row["default_effort"] = default_effort
-        visibility = item.get("visibility")
-        if visibility is not None:
-            if not isinstance(visibility, str) or not _ID_RE.fullmatch(visibility):
-                raise CatalogError("model_entry_invalid", provider)
-            row["visibility"] = visibility
-        normalized.append(row)
-    result = {"provider": provider, "source": source, "observed_at": observed_at,
-              "availability": availability, "models": normalized}
-    if version is not None:
-        result["cli_version"] = version
-    source_note = value.get("source_note")
-    if source_note in ("vendor_cache_not_live", "unauthenticated_vendor_registry",
-                       "vendor_registry_not_entitlement"):
-        result["source_note"] = source_note
-    if provider == "cursor":
-        mappings = value.get("effort_slugs")
-        if mappings is not None:
-            if not isinstance(mappings, dict):
-                raise CatalogError("effort_metadata_invalid", provider)
-            exact_ids = {row["id"] for row in normalized}
-            checked = {}
-            for base, by_effort in mappings.items():
-                if not isinstance(base, str) or not _ID_RE.fullmatch(base) or not isinstance(by_effort, dict):
-                    raise CatalogError("effort_metadata_invalid", provider)
-                checked[base] = {}
-                for effort, slug in by_effort.items():
-                    if effort not in CURSOR_EFFORTS or slug not in exact_ids:
-                        raise CatalogError("effort_metadata_invalid", provider)
-                    checked[base][effort] = slug
-            result["effort_slugs"] = checked
-    return result
-
-
-def _load_bundle():
-    path = Path(__file__).with_name("model_catalog.json")
-    try:
-        data = _json_loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        raise CatalogError("bundled_catalog_invalid")
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
-        raise CatalogError("bundled_catalog_invalid")
-    providers = data.get("providers")
-    if not isinstance(providers, dict):
-        raise CatalogError("bundled_catalog_invalid")
-    result = {}
-    for provider, record in providers.items():
-        if provider not in PROVIDERS:
-            raise CatalogError("bundled_catalog_invalid", provider)
-        result[provider] = validate_record(provider, record)
-    return result
-
-
-def bundled_catalog():
-    return _load_bundle()
-
-
-def agy_opus_alias_model(name, effort):
-    """Resolve only an explicit AGY Opus/version alias from bundled metadata.
-
-    This is local name normalization, not a discovery or entitlement probe.
-    Missing and ambiguous rows refuse instead of choosing another seat.
-    """
-    match = re.fullmatch(r"agy-opus-([0-9]+(?:\.[0-9]+)*)", str(name).strip(), re.I)
-    if not match:
-        return None, {"ok": False, "reason": "unsupported_model",
-                      "detail": "agy Opus shorthand requires an exact version"}
-    token = str(effort or "").strip().lower()
-    if token not in AGY_EFFORTS:
-        return None, {"ok": False, "reason": "unsupported_effort",
-                      "detail": "agy Opus shorthand requires a supported explicit effort"}
-    try:
-        record = bundled_catalog().get("agy") or {}
-    except CatalogError as exc:
-        return None, exc.envelope()
-    version = match.group(1)
-    family = []
-    for row in record.get("models", []):
-        label = re.fullmatch(r"Claude Opus ([0-9]+(?:\.[0-9]+)*) \(([^()]+)\)",
-                             row.get("name", ""), re.I)
-        if label and label.group(1) == version:
-            family.append((row, label.group(2).lower()))
-    matches = [row for row, level in family if level == token]
-    if len(matches) != 1:
-        return None, {"ok": False, "reason": "unsupported_effort" if family and not matches else "unsupported_model",
-                      "detail": "agy Opus shorthand has no unique bundled version/effort match"}
-    row = matches[0]
-    if row.get("routable_id") != ROAD_PREFIX["agy"] + row.get("id", ""):
-        return None, {"ok": False, "reason": "unsupported_model",
-                      "detail": "agy Opus shorthand has an invalid bundled route"}
-    return row["routable_id"], None
-
-
-def _load_cached(provider, profile):
-    try:
-        path, _status_path, _lock_path = _cache_paths(provider, profile)
-        if not path.exists():
-            return None, None
-        wrapper = _json_loads(path.read_text(encoding="utf-8"))
-        expected = _scope_fingerprint(provider, profile)
-        if (not isinstance(wrapper, dict) or wrapper.get("provider") != provider
-                or wrapper.get("scope_fingerprint") != expected):
-            raise CatalogError("cache_scope_mismatch", provider)
-        record = validate_record(provider, wrapper.get("record"))
-        last_success = wrapper.get("last_success_at")
-        if _utc_datetime(last_success) is None:
-            raise CatalogError("cache_invalid", provider)
-        return record, {"last_success_at": last_success}
-    except CatalogError as exc:
-        return None, {"reason": exc.reason}
-    except (OSError, ValueError, TypeError):
-        return None, {"reason": "cache_invalid"}
-
-
-def _read_last_result(provider, profile):
-    try:
-        _path, status_path, _lock_path = _cache_paths(provider, profile)
-        status = _json_loads(status_path.read_text(encoding="utf-8"))
-        if not isinstance(status, dict) or status.get("provider") != provider:
-            return None
-        return {key: status.get(key) for key in
-                ("status", "reason", "finished_at", "last_success_at") if key in status}
-    except (CatalogError, OSError, ValueError, TypeError):
-        return None
-
-
-def _write_status(provider, profile, status, reason=None, last_success_at=None):
-    _path, status_path, _lock_path = _cache_paths(provider, profile, create=True)
-    value = {"schema_version": SCHEMA_VERSION, "provider": provider,
-             "status": status, "finished_at": _utc_now()}
-    if reason:
-        value["reason"] = str(reason)
-    if last_success_at:
-        value["last_success_at"] = last_success_at
-    _atomic_write(status_path, (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
-
-
-def _save_last_good(provider, profile, record, diagnostics=None):
-    path, status_path, lock_path = _cache_paths(provider, profile, create=True)
-    fingerprint = _scope_fingerprint(provider, profile, create=True)
-    last_success = _utc_now()
-    wrapper = {"schema_version": SCHEMA_VERSION, "provider": provider,
-               "scope_fingerprint": fingerprint, "last_success_at": last_success,
-               "record": validate_record(provider, record)}
-    encoded = (json.dumps(wrapper, sort_keys=True, ensure_ascii=False,
-                          separators=(",", ":")) + "\n").encode("utf-8")
-    with _provider_lock(lock_path):
-        _atomic_write(path, encoded)
-        try:
-            _write_status(provider, profile, "ok", last_success_at=last_success)
-        except Exception:
-            if diagnostics is None:
-                raise
-            diagnostics["status_diagnostic"] = "status_write_failed"
-    return last_success
-
-
-def _availability_for_default(provider, record):
-    from providers import config
-    default_ids = {
-        "cursor": config.DEFAULT_CURSOR_MODEL,
-        "agy": config.DEFAULT_MODEL,
-        "codex": config.DEFAULT_CODEX_MODEL,
-        "claude": config.DEFAULT_CLAUDE_MODEL,
-        "grok": config.DEFAULT_GROK_MODEL,
-    }
-    wanted = default_ids[provider]
-    return any(wanted in (row["id"], row["name"], row["routable_id"])
-               for row in record.get("models", []))
-
-
-def _drift(baseline, current, provider):
-    before = {row["id"]: row for row in baseline.get("models", [])}
-    after = {row["id"]: row for row in current.get("models", [])}
-    effort_changes = {}
-    for model_id in sorted(set(before) & set(after)):
-        old = before[model_id].get("supported_efforts", [])
-        new = after[model_id].get("supported_efforts", [])
-        if old != new:
-            effort_changes[model_id] = {"bundled": old, "local": new}
-    defaults = {"bundled_available": _availability_for_default(provider, baseline),
-                "local_available": _availability_for_default(provider, current)}
-    added = sorted(set(after) - set(before))
-    removed = sorted(set(before) - set(after))
-    return {"added": added, "removed": removed, "effort_changes": effort_changes,
-            "default_availability": defaults,
-            "drift": bool(added or removed or effort_changes
-                          or defaults["bundled_available"] != defaults["local_available"])}
-
-
 def status(provider="all", profile="default", stale_after_s=DEFAULT_STALE_AFTER_S,
            details=False):
+    """Read v2 records only. A missing record is a row with null freshness."""
     try:
         selected = PROVIDERS if provider in (None, "all") else (provider,)
         if any(item not in PROVIDERS for item in selected):
             raise CatalogError("unknown_provider")
-        bundle = _load_bundle()
+        from providers import catalog_v2
         rows = []
         now = _datetime.datetime.now(_datetime.timezone.utc)
         for name in selected:
-            local, cache_info = _load_cached(name, profile)
-            record = local or bundle.get(name)
+            record, load_error = catalog_v2.load(name, profile)
             observed = _utc_datetime(record.get("observed_at")) if record else None
             age = max(0, int((now - observed).total_seconds())) if observed else None
-            last = _read_last_result(name, profile)
-            base = bundle.get(name)
             entry = {
                 "provider": name,
-                "source": record.get("source") if record else None,
-                "origin": "local" if local else "bundled" if record else None,
                 "observed_at": record.get("observed_at") if record else None,
                 "age_seconds": age,
                 "stale": age > int(stale_after_s) if age is not None else None,
-                "last_success_at": (cache_info or {}).get("last_success_at"),
-                "last_refresh": last,
                 "model_count": len(record.get("models", [])) if record else 0,
-                "availability": record.get("availability") if record else "unknown",
-                "baseline_drift": _drift(base, local, name) if base and local else None,
-                "cache_diagnostic": (cache_info or {}).get("reason"),
-                "discovery": adapter_coverage(name),
             }
+            if load_error:
+                entry["reason"] = load_error
             if details:
-                entry["models"] = list(record.get("models", [])) if record else []
+                entry["models"] = [
+                    {"id": row.get("id"), "name": row.get("name")}
+                    for row in (record.get("models", []) if record else [])
+                ]
             rows.append(entry)
         return {"ok": True, "profile": _profile_name(profile),
                 "details": bool(details), "catalogs": rows}
@@ -655,26 +414,107 @@ def status(provider="all", profile="default", stale_after_s=DEFAULT_STALE_AFTER_
         return exc.envelope()
 
 
+def _shipped_defaults(provider):
+    """Models ``models check`` admits for one provider. Grok also admits the image id."""
+    from providers import config
+    from providers.grok_image_cli import GROK_IMAGE_MODEL
+    return {
+        "claude": (config.DEFAULT_CLAUDE_MODEL,),
+        "codex": (config.DEFAULT_CODEX_MODEL,),
+        "grok": (config.DEFAULT_GROK_MODEL, GROK_IMAGE_MODEL),
+        "cursor": (config.DEFAULT_CURSOR_MODEL,),
+        "agy": (config.DEFAULT_MODEL,),
+    }[provider]
+
+
+def _admission_report(provider, profile):
+    """One admission outcome per shipped default, against this profile's v2 record."""
+    from providers import admission, catalog_v2
+    # The record itself is checked; today's gate depends on a request's
+    # environment, so it does not apply here.
+    record, load_error = catalog_v2.load(provider, profile)
+    now = _datetime.datetime.now(_datetime.timezone.utc)
+    rows = []
+    for model in _shipped_defaults(provider):
+        if load_error:
+            decision = {"refusal": load_error}
+        else:
+            decision = admission.decide(
+                {"provider": provider, "model": model, "effort": None},
+                record, now=now)
+        refusal = decision.get("refusal") if isinstance(decision, dict) else "no_catalog"
+        # effort_required is reported and is not a failing admission.
+        hard = refusal not in (None, "effort_required")
+        rows.append({
+            "model": model,
+            "ok": not hard,
+            "effort": decision.get("effort") if isinstance(decision, dict) else None,
+            "refusal": refusal,
+        })
+    return rows
+
+
+def admit(provider, model, effort=None, profile="default"):
+    """Admit one model and effort against one v2 record.
+
+    Loads that record and calls ``admission.decide``. Does not run the gate,
+    read aliases, spawn a vendor CLI, or write.
+    """
+    from providers import admission, catalog_v2
+    name = _profile_name(profile)
+    if provider not in PROVIDERS:
+        raise CatalogError("unknown_provider")
+    record, load_error = catalog_v2.load(provider, name)
+    if load_error:
+        decision = {
+            "model": None,
+            "effort": None,
+            "effort_source": None,
+            "warnings": [],
+            "refusal": load_error,
+        }
+    else:
+        decision = admission.decide(
+            {"provider": provider, "model": model, "effort": effort},
+            record, now=_datetime.datetime.now(_datetime.timezone.utc))
+    refusal = decision.get("refusal") if isinstance(decision, dict) else "no_catalog"
+    admitted = refusal is None
+    decided_model = decision.get("model") if isinstance(decision, dict) else None
+    decided_effort = decision.get("effort") if isinstance(decision, dict) else None
+    warnings = decision.get("warnings") if isinstance(decision, dict) else []
+    if not isinstance(warnings, list):
+        warnings = []
+    requested = model.strip() if isinstance(model, str) else ""
+    return {
+        "ok": admitted,
+        "admitted": admitted,
+        "provider": provider,
+        "profile": name,
+        "model": decided_model if isinstance(decided_model, str) and decided_model else requested,
+        "effort": decided_effort if decided_effort is not None else effort,
+        "effort_source": decision.get("effort_source") if isinstance(decision, dict) else None,
+        "refusal": refusal,
+        "warnings": list(warnings),
+    }
+
+
 def check(provider="all", profile="default"):
+    """Admit the shipped defaults against v2 records. A hard refusal is exit 2."""
     try:
         selected = PROVIDERS if provider in (None, "all") else (provider,)
         if any(item not in PROVIDERS for item in selected):
             raise CatalogError("unknown_provider")
-        bundle = _load_bundle()
-        rows, unusable = [], []
+        rows = []
+        blocked = False
         for name in selected:
-            local, cache_info = _load_cached(name, profile)
-            if local is None:
-                reason = (cache_info or {}).get("reason") or "last_good_missing"
-                rows.append({"provider": name, "ok": False, "reason": reason})
-                unusable.append(name)
-                continue
-            rows.append({"provider": name, "ok": True,
-                         **_drift(bundle[name], local, name)})
-        drifted = any(row.get("drift") for row in rows)
-        return {"ok": not unusable, "profile": _profile_name(profile),
-                "unusable": unusable, "drift": drifted, "providers": rows,
-                "exit_code": 2 if unusable else 3 if drifted else 0}
+            admission_rows = _admission_report(name, profile)
+            hard = any(not item["ok"] for item in admission_rows)
+            if hard:
+                blocked = True
+            rows.append({"provider": name, "ok": not hard,
+                         "admission": admission_rows})
+        return {"ok": not blocked, "profile": _profile_name(profile),
+                "providers": rows, "exit_code": 2 if blocked else 0}
     except CatalogError as exc:
         out = exc.envelope()
         out["exit_code"] = 2
@@ -690,100 +530,6 @@ def _parse_model_line(line, pattern, provider):
         raise CatalogError("malformed_output", provider)
     return {"id": model_id, "name": name, "routable_id": ROAD_PREFIX[provider] + model_id,
             "supported_efforts": [], "efforts_known": False}
-
-
-def _cursor_effort_candidates(model_ids, legacy_overrides=None):
-    ids = set(model_ids)
-    result = {}
-    overrides = legacy_overrides or {}
-    for (base, effort), slug in overrides.items():
-        if slug in ids and effort in CURSOR_EFFORTS:
-            result.setdefault(base, {})[effort] = slug
-    candidates = {}
-    for slug in sorted(ids):
-        base_id = slug[:-5] if slug.endswith("-fast") else slug
-        fast = slug.endswith("-fast")
-        matches = []
-        for spelling, effort in _EFFORT_SUFFIXES:
-            suffix = "-" + spelling
-            if base_id.endswith(suffix) and len(base_id) > len(suffix):
-                matches.append((base_id[:-len(suffix)], effort, fast))
-        if len(matches) != 1:
-            continue
-        base, effort, fast = matches[0]
-        if base in ids:
-            continue
-        candidates.setdefault(base, {}).setdefault(effort, []).append((slug, fast))
-    for base, by_effort in candidates.items():
-        if len(by_effort) < 2:
-            continue
-        for effort, variants in by_effort.items():
-            nonfast = [slug for slug, fast in variants if not fast]
-            chosen = nonfast if nonfast else [slug for slug, _fast in variants]
-            if len(chosen) == 1:
-                result.setdefault(base, {}).setdefault(effort, chosen[0])
-    return result
-
-
-def cursor_effort_map(record, legacy_overrides=None):
-    explicit = record.get("effort_slugs") if isinstance(record, dict) else None
-    if isinstance(explicit, dict):
-        return {base: dict(tokens) for base, tokens in explicit.items()}
-    ids = [row.get("id") for row in record.get("models", []) if isinstance(row, dict)]
-    return _cursor_effort_candidates(ids, legacy_overrides=legacy_overrides)
-
-
-def cursor_effort_slug(base, effort, profile=None, legacy_overrides=None):
-    """Return an exact observed Cursor effort slug from local ∪ bundle data."""
-    if effort is None:
-        return base, None
-    profile = active_profile() if profile is None else profile
-    try:
-        bundle = _load_bundle().get("cursor")
-    except CatalogError:
-        bundle = None
-    try:
-        local, _info = _load_cached("cursor", profile)
-    except CatalogError:
-        local = None
-    maps = []
-    if bundle:
-        maps.append(cursor_effort_map(bundle, legacy_overrides))
-    if local:
-        maps.append(cursor_effort_map(local, legacy_overrides))
-    for mapping in maps:
-        slug = mapping.get(base, {}).get(effort)
-        if slug:
-            return slug, None
-    return None, {"ok": False, "reason": "unsupported_effort",
-                  "detail": "cursor model %s has no observed %s slug" % (base, effort)}
-
-
-def _record_from_rows(provider, rows, *, source, observed_at, cli_version=None,
-                      availability="provider_advertised", source_note=None):
-    record = {"provider": provider, "source": source, "observed_at": observed_at,
-              "availability": availability, "models": rows}
-    if cli_version:
-        record["cli_version"] = cli_version
-    if source_note:
-        record["source_note"] = source_note
-    if provider == "cursor":
-        from providers.config import CURSOR_EFFORT_SLUG_OVERRIDES
-        effort_slugs = _cursor_effort_candidates(
-            [row["id"] for row in rows],
-            legacy_overrides=CURSOR_EFFORT_SLUG_OVERRIDES)
-        record["effort_slugs"] = effort_slugs
-        by_slug = {}
-        for by_effort in effort_slugs.values():
-            for effort, slug in by_effort.items():
-                by_slug.setdefault(slug, set()).add(effort)
-        for row in rows:
-            row["supported_efforts"] = sorted(
-                by_slug.get(row["id"], ()),
-                key=lambda e: ("minimal", "low", "medium", "high", "xhigh", "max").index(e))
-            row["efforts_known"] = row["id"] in by_slug
-    return validate_record(provider, record)
-
 
 def parse_cursor_output(output, *, observed_at=None, cli_version=None):
     if not isinstance(output, str) or len(output.encode("utf-8")) > MAX_STDOUT_BYTES:
@@ -816,10 +562,8 @@ def parse_cursor_output(output, *, observed_at=None, cli_version=None):
         raise CatalogError("incomplete_output", "cursor")
     if not rows:
         raise CatalogError("empty_output", "cursor")
-    record = _record_from_rows("cursor", rows, source="live",
-                               observed_at=observed_at or _utc_now(),
+    return _strict_live_record("cursor", rows, observed_at=observed_at,
                                cli_version=cli_version)
-    return record
 
 
 def parse_agy_output(output, *, observed_at=None, cli_version=None):
@@ -841,9 +585,27 @@ def parse_agy_output(output, *, observed_at=None, cli_version=None):
                      "supported_efforts": [], "efforts_known": False})
     if not rows:
         raise CatalogError("empty_output", "agy")
-    return _record_from_rows("agy", rows, source="live",
-                              observed_at=observed_at or _utc_now(),
-                              cli_version=cli_version)
+    return _strict_live_record("agy", rows, observed_at=observed_at,
+                               cli_version=cli_version)
+
+
+def _strict_live_record(provider, rows, *, observed_at, cli_version):
+    """Build one strict live record from rows that already passed format checks."""
+    from providers import catalog_record
+    record = {
+        "provider": provider,
+        "source": "live",
+        "observed_at": observed_at or _utc_now(),
+        "availability": "provider_advertised",
+        "models": rows,
+    }
+    if cli_version:
+        record["cli_version"] = cli_version
+    try:
+        strict, _warnings = catalog_record.validate_strict(provider, record)
+    except catalog_record.StrictRecordError as exc:
+        raise CatalogError(exc.reason, provider)
+    return strict
 
 
 def parse_agy_effort_tokens(help_output):
@@ -860,135 +622,12 @@ def parse_agy_effort_tokens(help_output):
         raise CatalogError("unsupported_effort", "agy")
     return frozenset(tokens)
 
+def _claude_models_from_control_events(output):
+    """Return the model list from one claude initialize stream.
 
-def parse_grok_output(output, *, observed_at=None, cli_version=None):
-    if not isinstance(output, str) or len(output.encode("utf-8")) > MAX_STDOUT_BYTES:
-        raise CatalogError("output_cap", "grok")
-    if output and not output.endswith("\n"):
-        raise CatalogError("incomplete_output", "grok")
-    rows = []
-    saw_header = False
-    default_id = None
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped == "You are not authenticated.":
-            raise CatalogError("auth_error", "grok")
-        if stripped == "You are logged in with grok.com.":
-            continue
-        if not stripped:
-            continue
-        if stripped.startswith("Default model: "):
-            default_id = stripped.split(":", 1)[1].strip()
-            continue
-        if stripped == "Available models:":
-            if saw_header:
-                raise CatalogError("malformed_output", "grok")
-            saw_header = True
-            continue
-        if not saw_header:
-            raise CatalogError("malformed_output", "grok")
-        match = re.fullmatch(r"[*-]\s+([^\s]+)(?:\s+\(default\))?", stripped)
-        if not match:
-            raise CatalogError("malformed_output", "grok")
-        model_id = match.group(1)
-        rows.append({"id": model_id, "name": model_id,
-                     "routable_id": ROAD_PREFIX["grok"] + model_id,
-                     "supported_efforts": [], "efforts_known": False})
-    if not saw_header or not rows or (default_id and default_id not in {r["id"] for r in rows}):
-        raise CatalogError("incomplete_output", "grok")
-    return _record_from_rows("grok", rows, source="live",
-                              observed_at=observed_at or _utc_now(),
-                              cli_version=cli_version, availability="unknown",
-                               source_note="vendor_registry_not_entitlement")
-
-
-def _effort_values(metadata, keys, provider):
-    for key in keys:
-        if key not in metadata:
-            continue
-        value = metadata[key]
-        if not isinstance(value, list):
-            raise CatalogError("effort_metadata_invalid", provider)
-        result = []
-        for entry in value:
-            if isinstance(entry, str):
-                token = entry
-            elif isinstance(entry, dict):
-                token_keys = ("reasoningEffort", "effort", "value")
-                declared = [entry[name] for name in token_keys if name in entry]
-                if len(declared) != 1 or not isinstance(declared[0], str):
-                    raise CatalogError("effort_metadata_invalid", provider)
-                token = declared[0]
-            else:
-                raise CatalogError("effort_metadata_invalid", provider)
-            if token not in EFFORTS:
-                raise CatalogError("effort_metadata_invalid", provider)
-            result.append(token)
-        ordered = sorted(set(result), key=lambda effort: (
-            "minimal", "low", "medium", "high", "xhigh", "max", "ultra").index(effort))
-        return ordered, True
-    return [], False
-
-
-def _metadata_row(provider, value, id_keys, name_keys, effort_keys, default_keys=(),
-                  visibility_key=None):
-    model_id = next((value.get(key) for key in id_keys
-                     if isinstance(value.get(key), str) and value.get(key)), None)
-    name = next((value.get(key) for key in name_keys
-                 if isinstance(value.get(key), str) and value.get(key)), None)
-    if model_id is None:
-        raise CatalogError("model_id_missing", provider)
-    efforts, efforts_known = _effort_values(value, effort_keys, provider)
-    supplied_defaults = [value[key] for key in default_keys if key in value]
-    if any(not isinstance(default, str) or default not in EFFORTS
-           for default in supplied_defaults):
-        raise CatalogError("effort_metadata_invalid", provider)
-    if len(set(supplied_defaults)) > 1:
-        raise CatalogError("effort_metadata_invalid", provider)
-    default = supplied_defaults[0] if supplied_defaults else None
-    row = {"id": model_id, "name": name or model_id,
-           "routable_id": ROAD_PREFIX[provider] + model_id,
-           "supported_efforts": efforts, "efforts_known": efforts_known}
-    if default is not None:
-        if not efforts_known or default not in efforts:
-            raise CatalogError("effort_metadata_invalid", provider)
-        row["default_effort"] = default
-    if visibility_key and isinstance(value.get(visibility_key), bool):
-        row["visibility"] = "hidden" if value[visibility_key] else "list"
-    return row
-
-
-def parse_codex_result(result, *, observed_at=None, cli_version=None):
-    if not isinstance(result, dict) or not isinstance(result.get("data"), list):
-        raise CatalogError("malformed_response", "codex")
-    if not result["data"]:
-        raise CatalogError("empty_output", "codex")
-    if any(not isinstance(item, dict) for item in result["data"]):
-        raise CatalogError("model_entry_invalid", "codex")
-    rows = [_metadata_row("codex", item, ("model", "id"), ("displayName", "name"),
-                          ("supportedReasoningEfforts",),
-                          ("defaultReasoningEffort",), "hidden")
-            for item in result["data"]]
-    return _record_from_rows("codex", rows, source="live",
-                              observed_at=observed_at or _utc_now(),
-                              cli_version=cli_version)
-
-
-def parse_claude_models(models, *, observed_at=None, cli_version=None):
-    if not isinstance(models, list) or not models:
-        raise CatalogError("empty_output", "claude")
-    rows = [_metadata_row("claude", item, ("value", "id"),
-                          ("displayName", "display_name", "name"),
-                          ("supportedEffortLevels",), visibility_key=None)
-            for item in models if isinstance(item, dict)]
-    if len(rows) != len(models):
-        raise CatalogError("model_entry_invalid", "claude")
-    return _record_from_rows("claude", rows, source="live",
-                              observed_at=observed_at or _utc_now(),
-                              cli_version=cli_version)
-
-
-def parse_claude_control_events(output, *, observed_at=None, cli_version=None):
+    This is the walk ``parse_claude_control_events`` has always done, before
+    today's effort gate. A v2 parse can keep tokens that gate rejects.
+    """
     if not isinstance(output, str) or len(output.encode("utf-8")) > MAX_STDOUT_BYTES:
         raise CatalogError("output_cap", "claude")
     found = []
@@ -1015,15 +654,19 @@ def parse_claude_control_events(output, *, observed_at=None, cli_version=None):
             raise CatalogError("unexpected_event", "claude")
     if len(found) != 1:
         raise CatalogError("incomplete_output", "claude")
-    return parse_claude_models(found[0], observed_at=observed_at,
-                               cli_version=cli_version)
+    return found[0]
 
 
-def adapter_coverage(provider):
-    if provider in PROVIDERS:
-        return {"status": "automatic_available", "manual_import": True}
-    return {"status": "discovery_unavailable", "manual_import": True}
-
+def parse_claude_control_events(output, *, observed_at=None, cli_version=None):
+    from providers import catalog_record
+    models = _claude_models_from_control_events(output)
+    try:
+        record = catalog_record.parse_claude_models(
+            models, observed_at=observed_at, cli_version=cli_version)
+        strict, _warnings = catalog_record.validate_strict("claude", record)
+    except catalog_record.StrictRecordError as exc:
+        raise CatalogError(exc.reason, "claude")
+    return strict
 
 def _decode_output(raw, provider):
     try:
@@ -1201,13 +844,106 @@ def _read_codex_response(reader, wanted_id):
         return message["result"]
 
 
+def _claude_discovery_argv(binary):
+    """The metadata argv `_discover_claude` has always built. No prompt is sent."""
+    return [binary, "--print", "--input-format", "stream-json",
+            "--output-format", "stream-json", "--verbose", "--tools", "",
+            "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
+            "--setting-sources", "", "--no-session-persistence",
+            "--disable-slash-commands"]
+
+
+def _discovery_posture():
+    """The platform chooses the posture. Callers do not."""
+    if platform.system() == "Darwin":
+        return _POSTURE_SEATBELT
+    return _POSTURE_UNFENCED
+
+
+def _resolved_metadata_binary(provider):
+    """The executable the discoverer looks up, or None.
+
+    Cursor, agy, and claude return the realpath their lookups already return.
+    Grok and codex are ``vendor_bin.which`` plus ``os.path.realpath``, which is
+    what ``_discover_grok`` and ``_discover_codex`` pass to the spawn.
+    """
+    if provider == "cursor":
+        from providers.cursor import resolve_bin
+        return resolve_bin()
+    if provider == "agy":
+        from providers.agy import find_agy
+        return find_agy()
+    if provider == "grok":
+        found = vendor_bin.which("grok")
+        return os.path.realpath(found) if found else None
+    if provider == "codex":
+        found = vendor_bin.which("codex")
+        return os.path.realpath(found) if found else None
+    if provider == "claude":
+        from providers.kernel_sandbox import resolve_agent_binary
+        return resolve_agent_binary("claude")
+    return None
+
+
+def _metadata_argv_allowed(provider, argv):
+    try:
+        parts = tuple(os.fsdecode(os.fspath(part)) for part in argv)
+    except (TypeError, ValueError):
+        return False
+    if not parts:
+        return False
+    resolved = _resolved_metadata_binary(provider)
+    if not resolved:
+        return False
+    try:
+        if os.path.realpath(parts[0]) != os.path.realpath(resolved):
+            return False
+    except (OSError, ValueError):
+        return False
+    if provider == "claude":
+        return list(parts) == _claude_discovery_argv(parts[0])
+    tail = _METADATA_ARGV_TAILS.get(provider)
+    return tail is not None and len(parts) == 1 + len(tail) and parts[1:] == tail
+
+
 def _require_verified_metadata_fence(metadata, provider):
     """Refuse metadata discovery unless the shared host fence proved its wrap."""
     if not isinstance(metadata, dict) or metadata.get("fence") != "seatbelt-fs":
         raise CatalogError("discovery_unavailable", provider)
 
 
+def _accept_discovery_posture(metadata, provider, argv):
+    """Admit one refresh discovery spawn under the platform posture.
+
+    Darwin still requires ``seatbelt-fs``. Everywhere else the shared fence
+    reports ``none``; only the fixed metadata argv may then start.
+    """
+    if _discovery_posture() == _POSTURE_SEATBELT:
+        _require_verified_metadata_fence(metadata, provider)
+        return
+    if not isinstance(metadata, dict) or metadata.get("fence") != "none":
+        raise CatalogError("discovery_unavailable", provider)
+    if not _metadata_argv_allowed(provider, argv):
+        raise CatalogError("discovery_unavailable", provider)
+
+
+def _attach_discovery(record):
+    """Record the posture that just ran. The platform is read, not chosen."""
+    stamped = dict(record)
+    stamped["discovery"] = {
+        "posture": _discovery_posture(),
+        "platform": platform.system(),
+    }
+    return stamped
+
+
 def _query_codex_models(binary, *, env, cwd, timeout_s):
+    raw = _fetch_codex_pages(binary, env=env, cwd=cwd, timeout_s=timeout_s)
+    return _strict_vendor_record("codex", raw)
+
+
+def _fetch_codex_pages(binary, *, env, cwd, timeout_s):
+    """Run the codex ``model/list`` exchange and return ``{"data": models}``."""
     try:
         argv, child_env, metadata = __import__("providers.host_fence", fromlist=["prepare_host_fence"]).prepare_host_fence(
             [binary, "app-server"], provider="codex", workdir=cwd,
@@ -1216,7 +952,7 @@ def _query_codex_models(binary, *, env, cwd, timeout_s):
     except Exception as exc:
         reason = getattr(getattr(exc, "envelope", None), "get", lambda *_: None)("reason")
         raise CatalogError(reason or "fence_unavailable", "codex")
-    _require_verified_metadata_fence(metadata, "codex")
+    _accept_discovery_posture(metadata, "codex", argv)
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=child_env,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1236,7 +972,6 @@ def _query_codex_models(binary, *, env, cwd, timeout_s):
         models = []
         cursor = None
         cursors_seen = set()
-        cli_version = None
         for page_no in range(MAX_CODEX_PAGES):
             params = {"limit": 100, "includeHidden": False}
             if cursor is not None:
@@ -1259,14 +994,14 @@ def _query_codex_models(binary, *, env, cwd, timeout_s):
             cursor = next_cursor
         else:
             raise CatalogError("pagination_limit", "codex")
-        return parse_codex_result({"data": models}, observed_at=_utc_now(),
-                                  cli_version=cli_version)
+        return _remember_fetch({"data": models})
     finally:
         _terminate_process(proc)
 
 
 def _spawn_one_shot(provider, argv, profile, timeout_s, *, config_dir=None,
-                    cursor_config=False, combine_stderr=False):
+                    cursor_config=False, combine_stderr=False,
+                    seatbelt_required=False):
     from providers.host_fence import HostFenceError, prepare_host_fence
 
     profile = _profile_name(profile)
@@ -1291,7 +1026,11 @@ def _spawn_one_shot(provider, argv, profile, timeout_s, *, config_dir=None,
         except HostFenceError as exc:
             reason = exc.envelope.get("reason") or "fence_unavailable"
             raise CatalogError(reason, provider)
-        _require_verified_metadata_fence(metadata, provider)
+        if seatbelt_required:
+            # Dispatch (agy effort) keeps the pre-posture check on every host.
+            _require_verified_metadata_fence(metadata, provider)
+        else:
+            _accept_discovery_posture(metadata, provider, fenced_argv)
         raw = _run_bounded(fenced_argv, env=child_env, cwd=cwd,
                            timeout_s=timeout_s, provider=provider,
                            combine_stderr=combine_stderr)
@@ -1302,23 +1041,36 @@ def _spawn_one_shot(provider, argv, profile, timeout_s, *, config_dir=None,
             shutil.rmtree(temp_config, ignore_errors=True)
 
 
-def _discover_cursor(profile, timeout_s):
+def _remember_fetch(value):
+    _FETCHED_OUTPUT.set(value)
+    return value
+
+
+def _fetch_cursor(profile, timeout_s):
     from providers.cursor import resolve_bin
     binary = resolve_bin()
     if not binary:
         raise CatalogError("cli_missing", "cursor")
     output = _spawn_one_shot("cursor", [binary, "--list-models"], profile,
                              timeout_s, cursor_config=True)
-    return parse_cursor_output(output)
+    return _remember_fetch(output)
 
 
-def _discover_agy(profile, timeout_s):
+def _discover_cursor(profile, timeout_s):
+    return _attach_discovery(parse_cursor_output(_fetch_cursor(profile, timeout_s)))
+
+
+def _fetch_agy(profile, timeout_s):
     from providers.agy import find_agy
     binary = find_agy()
     if not binary:
         raise CatalogError("cli_missing", "agy")
     output = _spawn_one_shot("agy", [binary, "models"], profile, timeout_s)
-    return parse_agy_output(output)
+    return _remember_fetch(output)
+
+
+def _discover_agy(profile, timeout_s):
+    return _attach_discovery(parse_agy_output(_fetch_agy(profile, timeout_s)))
 
 
 def agy_effort_tokens(profile="default", timeout_s=30):
@@ -1328,28 +1080,28 @@ def agy_effort_tokens(profile="default", timeout_s=30):
     if not binary:
         raise CatalogError("cli_missing", "agy")
     output = _spawn_one_shot("agy", [binary, "--help"], profile, timeout_s,
-                             combine_stderr=True)
+                             combine_stderr=True, seatbelt_required=True)
     return parse_agy_effort_tokens(output)
 
 
-def _discover_grok(profile, timeout_s):
+def _fetch_grok(profile, timeout_s):
     binary = vendor_bin.which("grok")
     if not binary:
         raise CatalogError("cli_missing", "grok")
     output = _spawn_one_shot("grok", [os.path.realpath(binary), "models"], profile, timeout_s)
-    return parse_grok_output(output)
+    return _remember_fetch(output)
 
 
-def _discover_claude(profile, timeout_s):
+def _discover_grok(profile, timeout_s):
+    return _attach_discovery(_strict_vendor_record("grok", _fetch_grok(profile, timeout_s)))
+
+
+def _fetch_claude(profile, timeout_s):
     from providers.kernel_sandbox import resolve_agent_binary
     binary = resolve_agent_binary("claude")
     if not binary:
         raise CatalogError("cli_missing", "claude")
-    argv = [binary, "--print", "--input-format", "stream-json",
-            "--output-format", "stream-json", "--verbose", "--tools", "",
-            "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
-            "--setting-sources", "", "--no-session-persistence",
-            "--disable-slash-commands"]
+    argv = _claude_discovery_argv(binary)
     from providers.host_fence import HostFenceError, prepare_host_fence
     _overrides, child_env, _allowed_env, _selected_home, _endpoints = (
         _catalog_child_environment("claude", profile))
@@ -1363,7 +1115,7 @@ def _discover_claude(profile, timeout_s):
                 env=child_env, config_dir=config_dir)
         except HostFenceError as exc:
             raise CatalogError(exc.envelope.get("reason") or "fence_unavailable", "claude")
-        _require_verified_metadata_fence(metadata, "claude")
+        _accept_discovery_posture(metadata, "claude", fenced)
         try:
             proc = subprocess.Popen(fenced, cwd=cwd, env=child_env,
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1399,13 +1151,17 @@ def _discover_claude(profile, timeout_s):
                 break
         else:
             raise CatalogError("timeout", "claude")
-        return parse_claude_control_events("\n".join(lines))
+        return _remember_fetch("\n".join(lines))
     finally:
         _terminate_process(proc)
         shutil.rmtree(cwd, ignore_errors=True)
 
 
-def _discover_codex(profile, timeout_s):
+def _discover_claude(profile, timeout_s):
+    return _attach_discovery(parse_claude_control_events(_fetch_claude(profile, timeout_s)))
+
+
+def _fetch_codex(profile, timeout_s):
     _overrides, child_env, _allowed_env, _selected_home, _endpoints = (
         _catalog_child_environment("codex", profile))
     binary = vendor_bin.which("codex")
@@ -1413,10 +1169,31 @@ def _discover_codex(profile, timeout_s):
         raise CatalogError("cli_missing", "codex")
     cwd = tempfile.mkdtemp(prefix="omni-catalog-codex-")
     try:
-        return _query_codex_models(os.path.realpath(binary), env=child_env,
-                                   cwd=cwd, timeout_s=timeout_s)
+        return _fetch_codex_pages(
+            os.path.realpath(binary), env=child_env, cwd=cwd, timeout_s=timeout_s)
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
+
+
+def _discover_codex(profile, timeout_s):
+    return _attach_discovery(_strict_vendor_record(
+        "codex", _fetch_codex(profile, timeout_s)))
+
+
+def _strict_vendor_record(provider, raw):
+    """Parse codex or grok vendor output into a strict record."""
+    from providers import catalog_record
+    try:
+        if provider == "codex":
+            record = catalog_record.parse_codex_result(raw, observed_at=_utc_now())
+        elif provider == "grok":
+            record = catalog_record.parse_grok_output(raw, observed_at=_utc_now())
+        else:
+            raise CatalogError("unknown_provider", provider)
+        strict, _warnings = catalog_record.validate_strict(provider, record)
+    except catalog_record.StrictRecordError as exc:
+        raise CatalogError(exc.reason, provider)
+    return strict
 
 
 _DISCOVERERS = {"cursor": _discover_cursor, "agy": _discover_agy,
@@ -1456,27 +1233,39 @@ def _best_effort_cli_version(provider, profile, timeout_s):
 
 
 def _refresh_failure_result(provider, profile, reason):
-    previous, info = False, None
-    try:
-        previous, info = _load_cached(provider, profile)
-        previous = previous is not None
-    except Exception:
-        info = {"reason": "cache_unavailable"}
-    result = {"ok": False, "reason": reason,
-              "last_success_at": (info or {}).get("last_success_at"),
-              "last_good_preserved": previous}
-    diagnostic = (info or {}).get("reason")
-    if diagnostic:
-        result["cache_diagnostic"] = diagnostic
-    try:
-        _write_status(provider, profile, "error", reason=reason,
-                      last_success_at=(info or {}).get("last_success_at"))
-    except Exception:
-        result["status_diagnostic"] = "status_write_failed"
-    return result
+    """Report one provider failure. This does not read or write a catalog."""
+    del profile
+    return {"ok": False, "provider": provider, "reason": reason,
+            "detail": "model catalog %s" % reason}
+
+
+def _v2_record_from_raw(provider, raw, cli_version):
+    """Parse one fetched payload with the strict parsers and validate it."""
+    from providers import catalog_record
+
+    if provider == "claude":
+        models = _claude_models_from_control_events(raw)
+        record = catalog_record.parse_claude_models(
+            models, cli_version=cli_version)
+    elif provider == "codex":
+        record = catalog_record.parse_codex_result(raw, cli_version=cli_version)
+    elif provider == "grok":
+        record = catalog_record.parse_grok_output(raw, cli_version=cli_version)
+    elif provider == "cursor":
+        record = parse_cursor_output(raw, cli_version=cli_version)
+    elif provider == "agy":
+        record = parse_agy_output(raw, cli_version=cli_version)
+    else:
+        raise CatalogError("unknown_provider", provider)
+    record = _attach_discovery(record)
+    strict, _warnings = catalog_record.validate_strict(provider, record)
+    return strict
 
 
 def refresh(provider="all", profile="default", timeout_s=30):
+    """Discover each provider and write only the v2 record. Success follows that write."""
+    from providers import catalog_record, catalog_v2
+
     selected = PROVIDERS if provider in (None, "all") else (provider,)
     if any(item not in PROVIDERS for item in selected):
         return {"ok": False, "reason": "unknown_provider", "providers": {}}
@@ -1489,155 +1278,48 @@ def refresh(provider="all", profile="default", timeout_s=30):
         return {"ok": False, "reason": "invalid_arguments", "providers": {}}
     results = {}
     for name in selected:
+        fetched = _FETCHED_OUTPUT.set(None)
+        applied_version = None
         try:
-            deadline = time.monotonic() + timeout_s
-            record = validate_record(name, _DISCOVERERS[name](profile, timeout_s))
-            remaining = deadline - time.monotonic()
-            version_budget = min(2, int(remaining - 0.25))
-            if version_budget > 0:
-                try:
-                    version = _best_effort_cli_version(name, profile, version_budget)
-                except Exception:
-                    version = None
-                if version:
-                    record["cli_version"] = version
-            save_diagnostics = {}
-            last_success = _save_last_good(name, profile, record,
-                                           diagnostics=save_diagnostics)
-            results[name] = {"ok": True, "source": record["source"],
-                             "observed_at": record["observed_at"],
-                             "last_success_at": last_success,
-                             "model_count": len(record["models"]),
-                             **save_diagnostics}
-        except CatalogError as exc:
-            results[name] = _refresh_failure_result(name, profile, exc.reason)
-        except Exception:
-            results[name] = _refresh_failure_result(name, profile, "runtime_error")
+            try:
+                deadline = time.monotonic() + timeout_s
+                discovered = _DISCOVERERS[name](profile, timeout_s)
+                remaining = deadline - time.monotonic()
+                version_budget = min(2, int(remaining - 0.25))
+                if version_budget > 0:
+                    try:
+                        version = _best_effort_cli_version(name, profile, version_budget)
+                    except Exception:
+                        version = None
+                    if version:
+                        applied_version = version
+                raw = _FETCHED_OUTPUT.get()
+                if raw is not None:
+                    record = _v2_record_from_raw(name, raw, applied_version)
+                else:
+                    if applied_version and isinstance(discovered, dict):
+                        discovered = dict(discovered)
+                        discovered["cli_version"] = applied_version
+                    record, _warnings = catalog_record.validate_strict(name, discovered)
+                catalog_v2.save(name, profile, record)
+                results[name] = {"ok": True, "provider": name,
+                                 "source": record["source"],
+                                 "observed_at": record["observed_at"],
+                                 "model_count": len(record["models"])}
+            except CatalogError as exc:
+                results[name] = _refresh_failure_result(name, profile, exc.reason)
+            except catalog_record.StrictRecordError as exc:
+                results[name] = _refresh_failure_result(name, profile, exc.reason)
+            except Exception:
+                results[name] = _refresh_failure_result(name, profile, "runtime_error")
+            finally:
+                # Per-provider failures must never abort later roads.
+                if name not in results:
+                    results[name] = _refresh_failure_result(name, profile, "runtime_error")
         finally:
-            # Per-provider profile/cache/status failures must never abort later roads.
-            if name not in results:
-                results[name] = {"ok": False, "reason": "runtime_error",
-                                 "last_good_preserved": False}
+            _FETCHED_OUTPUT.reset(fetched)
     return {"ok": all(item.get("ok") for item in results.values()),
             "profile": profile, "providers": results}
-
-
-def manual_import(provider, profile, path):
-    if provider not in PROVIDERS:
-        return {"ok": False, "reason": "unknown_provider", "provider": provider}
-    try:
-        profile = _profile_name(profile)
-        raw = Path(path).read_text(encoding="utf-8")
-        value = _json_loads(raw)
-        if isinstance(value, dict) and isinstance(value.get("providers"), dict):
-            value = value["providers"].get(provider)
-        if not isinstance(value, dict) or value.get("provider", provider) != provider:
-            raise CatalogError("schema_invalid", provider)
-        rows = value.get("models")
-        if not isinstance(rows, list):
-            raise CatalogError("model_list_invalid", provider)
-        normalized_rows = []
-        for row in rows:
-            if not isinstance(row, dict):
-                raise CatalogError("model_entry_invalid", provider)
-            model_id = row.get("id", row.get("value", row.get("model")))
-            name = row.get("name", row.get("displayName", row.get("display_name", model_id)))
-            normalized_rows.append({
-                "id": model_id, "name": name,
-                "routable_id": row.get(
-                    "routable_id", ROAD_PREFIX[provider] + str(model_id)),
-                "supported_efforts": row.get("supported_efforts", []),
-                "efforts_known": row.get("efforts_known", "supported_efforts" in row),
-                **({"default_effort": row["default_effort"]} if "default_effort" in row else {}),
-                **({"visibility": row["visibility"]} if "visibility" in row else {}),
-            })
-        record = {"provider": provider, "source": "manual",
-                  "observed_at": value.get("observed_at"),
-                  "availability": "unknown", "models": normalized_rows}
-        if value.get("cli_version"):
-            record["cli_version"] = value["cli_version"]
-        if provider == "cursor" and value.get("effort_slugs") is not None:
-            record["effort_slugs"] = value["effort_slugs"]
-        record = validate_record(provider, record)
-        save_diagnostics = {}
-        last_success = _save_last_good(provider, profile, record,
-                                       diagnostics=save_diagnostics)
-        return {"ok": True, "provider": provider, "source": "manual",
-                "availability": "unknown", "observed_at": record["observed_at"],
-                "last_success_at": last_success, "model_count": len(record["models"]),
-                **save_diagnostics}
-    except CatalogError as exc:
-        return exc.envelope()
-    except (OSError, ValueError, TypeError):
-        return {"ok": False, "provider": provider, "reason": "import_invalid",
-                "detail": "model catalog import_invalid"}
-
-
-def _output_path(path):
-    if not path:
-        raise CatalogError("output_required")
-    requested = Path(os.path.abspath(os.path.expanduser(str(path))))
-    if requested.is_symlink() or (requested.exists() and not requested.is_file()):
-        raise CatalogError("output_path_invalid")
-    current = requested.parent
-    while True:
-        if current.is_symlink():
-            alias = str(current) in ("/tmp", "/var")
-            resolved_alias = os.path.realpath(current)
-            if not alias or resolved_alias not in ("/private/tmp", "/private/var"):
-                raise CatalogError("output_path_invalid")
-        if current.parent == current:
-            break
-        current = current.parent
-    parent = Path(os.path.realpath(requested.parent))
-    if not parent.is_dir():
-        raise CatalogError("output_path_invalid")
-    target = parent / requested.name
-    if target.is_symlink() or (target.exists() and not target.is_file()):
-        raise CatalogError("output_path_invalid")
-    return target
-
-
-def snapshot(path, provider="all", profile="default"):
-    try:
-        target = _output_path(path)
-        profile = _profile_name(profile)
-        selected = PROVIDERS if provider in (None, "all") else (provider,)
-        if any(item not in PROVIDERS for item in selected):
-            raise CatalogError("unknown_provider")
-        bundle = _load_bundle()
-        providers = dict(bundle)
-        if target.exists():
-            try:
-                existing = _json_loads(target.read_text(encoding="utf-8"))
-                if existing.get("schema_version") != SCHEMA_VERSION or not isinstance(existing.get("providers"), dict):
-                    raise CatalogError("snapshot_invalid")
-                for name, record in existing["providers"].items():
-                    if name not in PROVIDERS:
-                        raise CatalogError("snapshot_invalid")
-                    providers[name] = validate_record(name, record)
-            except CatalogError:
-                raise
-            except (OSError, ValueError, TypeError):
-                raise CatalogError("snapshot_invalid")
-        for name in selected:
-            local, cache_info = _load_cached(name, profile)
-            if cache_info and cache_info.get("reason") not in (None, "cache_identity_unavailable"):
-                raise CatalogError("cache_invalid", name)
-            record = local or bundle.get(name)
-            if record is None:
-                raise CatalogError("catalog_unavailable", name)
-            providers[name] = record
-        output = {"schema_version": SCHEMA_VERSION, "exported_at": _utc_now(),
-                  "providers": {name: providers[name] for name in PROVIDERS if name in providers}}
-        encoded = (json.dumps(output, sort_keys=True, ensure_ascii=False,
-                              indent=2) + "\n").encode("utf-8")
-        _atomic_write(target, encoded, mode=0o644)
-        return {"ok": True, "output": str(target), "providers": list(output["providers"]),
-                "exported_at": output["exported_at"]}
-    except CatalogError as exc:
-        return exc.envelope()
-
 
 def _default_path(provider, profile):
     root = _catalog_root(create=False)

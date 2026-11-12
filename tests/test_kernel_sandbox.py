@@ -23,6 +23,24 @@ from providers import agent_lane, kernel_sandbox, sandbox_canary
 from tests import offline_home
 
 
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
+
 class TestKernelSandboxProfile(unittest.TestCase):
     """S1 / S5.1–S5.2: profile text and realpath params."""
 
@@ -617,6 +635,8 @@ class TestRunAgentKernelFenceWiring(unittest.TestCase):
     """Both macOS Codex lanes require host fencing; legacy cases pin Linux."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.workdir = tempfile.mkdtemp(prefix="omni_ksb_agent_")
         self.addCleanup(_rmtree, self.workdir)
         self.old_depth = os.environ.get(agent_lane.ENV_DEPTH)
@@ -975,6 +995,8 @@ class TestReadWallProfile(unittest.TestCase):
     """Issue #45: read_wall profile clauses and re-allow params."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.workdir = tempfile.mkdtemp(prefix="omni_ksb_rw_")
         self.addCleanup(_rmtree, self.workdir)
 
@@ -1120,6 +1142,8 @@ class TestCursorFenceGuards(unittest.TestCase):
     turn into a re-allow of home itself or a direct child of it."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         self.old_bin = os.environ.get(kernel_sandbox.ENV_CURSOR_BIN)
         self.addCleanup(self._restore_bin)
 
@@ -1533,6 +1557,10 @@ class TestCursorFenceGuards(unittest.TestCase):
 
 
 class TestClaudeFenceGuards(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _fake_home(self):
         home = os.path.realpath(tempfile.mkdtemp(prefix="omni_ksb_claude_home_"))
         self.addCleanup(_rmtree, home)
@@ -1728,6 +1756,11 @@ class TestClaudeFenceGuards(unittest.TestCase):
 
 class TestCodexGrokSiblingHomeDeny(unittest.TestCase):
     """Mirror of the Claude sibling-ring rule for CODEX_HOME_<P> / GROK_HOME_<P>."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     PROVIDERS = (("codex", "CODEX_HOME_", ".codex"), ("grok", "GROK_HOME_", ".grok"))
 
     def _dir(self, prefix):
@@ -1799,6 +1832,11 @@ class TestCodexGrokSiblingHomeDeny(unittest.TestCase):
 
 class TestAccountHomeIsolation(unittest.TestCase):
     """Named claude homes, per-run symlinks, and the registry-wide read walls."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     CONFIG_NAMES = (
         ("settings.json", "literal"), ("settings.local.json", "literal"),
         ("hooks", "subpath"), ("plugins", "subpath"), ("commands", "subpath"),
@@ -1950,6 +1988,10 @@ class TestAccountHomeIsolation(unittest.TestCase):
 class TestAccountHomeIsolationLive(unittest.TestCase):
     """Real sandbox-exec: the account-isolation rows hold at the kernel."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _dir(self, prefix):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
         self.addCleanup(_rmtree, path)
@@ -2021,6 +2063,10 @@ class TestAccountHomeIsolationLive(unittest.TestCase):
 class TestFenceOrderingFinalRows(unittest.TestCase):
     """Seatbelt is last-match-wins: protected-config and sibling-home denies
     are FINAL rows, and a protected name that aliases is refused up front."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def _dir(self, prefix):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
@@ -2275,6 +2321,10 @@ class TestFenceOrderingFinalRows(unittest.TestCase):
 @unittest.skipUnless(kernel_sandbox.available(), "sandbox-exec not available")
 class TestFenceOrderingLive(unittest.TestCase):
     """Real sandbox-exec: a later allow cannot reopen a final deny."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def _dir(self, prefix):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
@@ -2726,6 +2776,8 @@ class TestConsultCodexFenceWiring(unittest.TestCase):
     """Behavioral pins for providers.codex consult-lane fence (issue #45)."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         from providers import codex as codex_mod
         self.codex_mod = codex_mod
         self.old_run_cli = codex_mod.run_cli
@@ -2974,6 +3026,10 @@ class TestCodexDefaultConsultFence(unittest.TestCase):
     """The default-account codex consult gets the agent lane's protected
     configuration rows: final write denies and the alias refusal."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _dir(self, prefix, base=None):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir=base))
         self.addCleanup(_rmtree, path)
@@ -3107,6 +3163,10 @@ class TestCodexDefaultConsultFence(unittest.TestCase):
 class TestCodexDefaultConsultLive(unittest.TestCase):
     """Real sandbox-exec over the default-account consult policy."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _dir(self, prefix, base=None):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir=base))
         self.addCleanup(_rmtree, path)
@@ -3222,6 +3282,10 @@ class TestCodexModelsCacheReadOnly(unittest.TestCase):
     """models_cache.json feeds later sessions on the same account, so no
     fenced codex child may write it (consult and agent, default and named)."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _dir(self, prefix):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
         self.addCleanup(_rmtree, path)
@@ -3335,6 +3399,10 @@ def _other_case(path):
 class TestRefusalsIgnoreCaseAndNormalization(unittest.TestCase):
     """realpath keeps the caller's spelling; APFS and Seatbelt do not care."""
 
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _dir(self, prefix):
         path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
         self.addCleanup(_rmtree, path)
@@ -3440,6 +3508,10 @@ class TestRefusalsIgnoreCaseAndNormalization(unittest.TestCase):
 class TestVendorStateLeavesRefuseSymlinks(unittest.TestCase):
     """A child can replace its own writable state leaf with a symlink; the
     next run must refuse it, never allow writes at the link's target."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def _home(self):
         home = os.path.realpath(tempfile.mkdtemp(prefix="omni_ksb_leaf_home_"))

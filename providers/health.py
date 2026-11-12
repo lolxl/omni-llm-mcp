@@ -65,6 +65,19 @@ def _profile_value(profile):
     return "default" if profile is None else str(profile)
 
 
+def _cursor_slug_for_pool(remainder):
+    """Billing slug. ``sol`` and ``fable`` follow the alias file's target."""
+    text = str(remainder or "")
+    key = text.strip().lower()
+    if key in ("sol", "fable"):
+        try:
+            from providers.aliases import AliasError, effective
+            return effective().get("family.%s.cursor" % key)
+        except AliasError:
+            pass
+    return _cursor_alias_model(text)
+
+
 def pool_key(model, profile):
     """Return the health-ledger key ``<pool>@<profile>`` (issue #72).
 
@@ -72,27 +85,32 @@ def pool_key(model, profile):
     It is never collapsed: a non-default profile that can reach the ledger
     is a real separate login (unsupported profiles are refused upstream).
 
-    *pool* is the model string, except for ``cursor/<remainder>`` (prefix
-    matched case-insensitively): remainder ``auto`` → ``cursor:auto``; a
-    remainder whose slug (after alias resolution) starts with a stem in
+    *pool* is the model string, except for two rewrites. A Codex or Claude
+    logical family seat (``codex/sol``, ``claude/fable``) uses the same key
+    as the concrete model admission sends: the built-in on today's gate, or
+    the alias file's target on the catalog gate (the built-in when that file
+    is absent or refused). ``cursor/<remainder>``
+    (prefix matched case-insensitively) is resolved through the alias file
+    first (``sol`` and ``fable``). The resolved slug ``auto`` →
+    ``cursor:auto``; a slug that starts with a stem in
     ``CURSOR_MODELS_POOL_STEMS`` → ``cursor:cursor-models``; every other
-    ``cursor/`` remainder → ``cursor:other-models``.
+    ``cursor/`` slug → ``cursor:other-models``.
     """
     model_text = str(model)
     profile_text = _profile_value(profile)
     lower = model_text.lower()
     if lower.startswith("cursor/"):
         remainder = model_text[len("cursor/"):]
-        if remainder.lower() == "auto":
+        slug = _cursor_slug_for_pool(remainder).lower()
+        if slug == "auto":
             pool = "cursor:auto"
+        elif slug.startswith(CURSOR_MODELS_POOL_STEMS):
+            pool = "cursor:cursor-models"
         else:
-            slug = _cursor_alias_model(remainder).lower()
-            if slug.startswith(CURSOR_MODELS_POOL_STEMS):
-                pool = "cursor:cursor-models"
-            else:
-                pool = "cursor:other-models"
+            pool = "cursor:other-models"
     else:
-        pool = model_text
+        from providers.family import health_model
+        pool = health_model(model_text, profile_text) or model_text
     return "%s@%s" % (pool, profile_text)
 
 

@@ -4,14 +4,19 @@ The recorder and the synthetic home live in tests/offline_home.py. These
 cases check the mechanism in throwaway interpreters whose "real home" is a
 synthetic directory, so nothing here reads the operator's actual home.
 """
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
+from unittest import mock
 
+from providers import kernel_sandbox
 from tests import offline_home
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -198,6 +203,133 @@ _CLEANUP = textwrap.dedent("""
 
 # The same entry point with a normal removal: must return the run's status.
 _CLEAN = _CLEANUP.replace("shutil.rmtree = refusing\n", "")
+
+# Children of the helper tests below. Each runs in a fresh, unarmed interpreter
+# and prints the synthetic home it made before it does anything else.
+_EXIT_ABNORMAL = textwrap.dedent("""
+    import sys
+    ROOT = @ROOT@
+    sys.path.insert(0, ROOT)
+    from tests import offline_home
+    how = sys.argv[1]
+    if how == "install":
+        home = offline_home.install(real=sys.argv[2])
+    else:
+        home = offline_home.use_synthetic_home().home
+    print(home, flush=True)
+    if how == "raise":
+        raise RuntimeError("abnormal end")
+    sys.exit(3)
+""")
+
+_ACCOUNT_ENV = textwrap.dedent("""
+    import json, os, sys
+    ROOT = @ROOT@
+    sys.path.insert(0, ROOT)
+    from tests import offline_home
+    names = json.loads(sys.argv[1])
+    before = {k: os.environ.get(k) for k in names}
+    handle = offline_home.use_synthetic_home()
+    during = {k: os.environ.get(k) for k in names}
+    home = os.environ["HOME"]
+    handle.close()
+    after = {k: os.environ.get(k) for k in names}
+    print(json.dumps({"before": before, "during": during, "after": after,
+                      "home": home, "fake": handle.home,
+                      "exists": os.path.exists(handle.home)}))
+""")
+
+
+# Direct-mode children (use_synthetic_home without the runner). One fresh
+# interpreter per case; argv[1] names the scenario, argv[2] is its JSON spec.
+_DIRECT = textwrap.dedent("""
+    import json, os, subprocess, sys
+    ROOT = @ROOT@
+    sys.path.insert(0, ROOT)
+    from tests import offline_home
+    scenario, spec = sys.argv[1], json.loads(sys.argv[2])
+    real = spec["real"]
+    NAMES = [offline_home.ENV_HOME, offline_home.ENV_REAL, offline_home.ENV_LOG,
+             "PYTHONPATH"]
+
+    def snapshot():
+        return {k: os.environ.get(k) for k in NAMES}
+
+    def run_child(code, env=None, cwd=ROOT):
+        merged = dict(os.environ)
+        merged.update(env or {})
+        proc = subprocess.run([sys.executable, "-c", code], cwd=cwd, env=merged,
+                              capture_output=True, text=True)
+        return {"rc": proc.returncode, "out": proc.stdout.strip(),
+                "err": proc.stderr[-300:]}
+
+    def verdict(handle):
+        try:
+            handle.assert_module_hermetic()
+        except AssertionError as exc:
+            return str(exc)
+        return None
+
+    out = {}
+    if scenario == "child":
+        handle = offline_home.use_synthetic_home(real=real)
+        out.update(home=handle.home, log=handle.log)
+        out["child"] = run_child(spec["code"], spec.get("env"),
+                                 spec.get("cwd") or ROOT)
+        out["verdict"] = verdict(handle)
+        out["rows"] = [list(r) for r in handle.child_rows()]
+        handle.close()
+        out["exists_after"] = os.path.exists(handle.home)
+    elif scenario == "restore":
+        for key, value in spec["seed"].items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        out["before"] = snapshot()
+        handle = offline_home.use_synthetic_home(real=real)
+        out.update(home=handle.home, log=handle.log, during=snapshot())
+        handle.close()
+        out["after"] = snapshot()
+    elif scenario == "runner":
+        runner_home = offline_home.install(real=real)
+        before = snapshot()
+        handle = offline_home.use_synthetic_home(real=real)
+        out.update(home=handle.home, runner_home=runner_home, log=handle.log,
+                   runner_log=os.environ[offline_home.ENV_LOG],
+                   same_env=snapshot() == before)
+        out["child"] = run_child(spec["code"])
+        out["verdict"] = verdict(handle)
+        out["runner_rows"] = [list(r) for r in offline_home.violations()]
+        handle.close()
+        out["after_close_same_env"] = snapshot() == before
+        out["runner_home_exists"] = os.path.exists(runner_home)
+        offline_home.uninstall()
+    elif scenario == "sequence":
+        first = offline_home.use_synthetic_home(real=real)
+        out["first"] = {"home": first.home, "log": first.log,
+                        "env_log": os.environ[offline_home.ENV_LOG]}
+        out["first"]["child"] = run_child(spec["code"])
+        out["first"]["verdict"] = verdict(first)
+        first.close()
+        out["first"]["exists_after"] = os.path.exists(first.home)
+        second = offline_home.use_synthetic_home(real=real)
+        out["second"] = {"home": second.home, "log": second.log,
+                         "env_log": os.environ[offline_home.ENV_LOG],
+                         "rows": [list(r) for r in second.child_rows()],
+                         "verdict": verdict(second)}
+        out["second"]["child"] = run_child(spec["clean_code"])
+        out["second"]["verdict_after_child"] = verdict(second)
+        second.close()
+    print(json.dumps(out))
+""")
+
+_HOME_CODE = ("from providers import kernel_sandbox as k\n"
+              "print(k.protected_home())\n")
+_ADMIT_CODE = ("import os\n"
+               "from providers import kernel_sandbox as k\n"
+               "k.admit_path(os.path.join(os.environ['OMNI_OFFLINE_REAL_HOME'],"
+               " '.claude.json'), 'literal', label='c')\n")
 
 
 def _clean_env():
@@ -400,6 +532,324 @@ class TestRecorderMechanism(unittest.TestCase):
         self.assertIn("No module named", rows[0][2])
         self.assertIn("could not arm", offline_home.format_violations(
             [tuple(r) for r in rows]))
+
+
+class TestSyntheticHomeHelper(unittest.TestCase):
+    """``use_synthetic_home`` / ``SyntheticHome`` with a stand-in real home.
+
+    Nothing here names or reads the operator's home: the "real" home is a temp
+    directory, and the children make (and must remove) their own synthetic
+    homes.
+    """
+
+    def child(self, template, *args, env=None):
+        proc = subprocess.run(
+            [sys.executable, "-c", _script(template), *args], cwd=ROOT,
+            env=env or _clean_env(), capture_output=True, text=True,
+            timeout=120)
+        out = proc.stdout.strip().splitlines()
+        self.addCleanup(self.drop, out[0] if out else None)
+        return proc, out
+
+    def drop(self, home):
+        # Only a home printed by a child of this very test.
+        if home and os.path.basename(home).startswith("omni_offline_home_"):
+            shutil.rmtree(home, ignore_errors=True)
+
+    def stand_in_home(self):
+        tmp = tempfile.TemporaryDirectory(prefix="omni_guard_real_")
+        self.addCleanup(tmp.cleanup)
+        return os.path.realpath(tmp.name)
+
+    def test_home_is_removed_after_an_uncaught_exception(self):
+        proc, out = self.child(_EXIT_ABNORMAL, "raise")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("abnormal end", proc.stderr)
+        self.assertTrue(out, proc.stderr)
+        self.assertFalse(os.path.lexists(out[0]), out[0])
+
+    def test_home_is_removed_after_sys_exit(self):
+        proc, out = self.child(_EXIT_ABNORMAL, "exit")
+        self.assertEqual(proc.returncode, 3)
+        self.assertTrue(out, proc.stderr)
+        self.assertFalse(os.path.lexists(out[0]), out[0])
+
+    def test_the_runners_home_is_removed_after_an_abnormal_exit(self):
+        proc, out = self.child(_EXIT_ABNORMAL, "install", self.stand_in_home())
+        self.assertEqual(proc.returncode, 3)
+        self.assertTrue(out, proc.stderr)
+        self.assertFalse(os.path.lexists(out[0]), out[0])
+
+    def make_case(self, handle, bad):
+        """A throwaway test that admits *bad* (or nothing) under *handle*."""
+        class Inner(unittest.TestCase):
+            def runTest(inner):
+                handle.mark()
+                inner.addCleanup(handle.assert_hermetic, inner)
+                if bad:
+                    handle.admitted.append(bad)
+        return Inner()
+
+    def test_an_admission_is_blamed_on_its_own_test_only(self):
+        real = self.stand_in_home()
+        handle = offline_home.SyntheticHome("/synthetic/stand-in", real)
+        first = self.make_case(handle, os.path.join(real, ".claude.json"))
+        second = self.make_case(handle, None)
+        for case, expect_ok in ((first, False), (second, True)):
+            result = unittest.TextTestResult(io.StringIO(), True, 1)
+            case.run(result)
+            self.assertEqual(result.wasSuccessful(), expect_ok,
+                             [str(f) for f in result.failures + result.errors])
+
+    def test_without_a_mark_every_admission_is_still_reported(self):
+        real = self.stand_in_home()
+        handle = offline_home.SyntheticHome("/synthetic/stand-in", real)
+        handle.admitted.append(os.path.join(real, ".claude.json"))
+        handle.admitted.append("/synthetic/stand-in/.claude.json")
+        self.assertEqual(handle.real_home_admissions(),
+                         [os.path.join(real, ".claude.json")])
+        handle.mark()
+        self.assertEqual(handle.real_home_admissions(), [])
+
+    def installed_handle(self, real):
+        """A real handle whose wrapper is installed over a fake admit_path.
+
+        The fake never touches the filesystem, so this runs on any host.
+        """
+        def fake(raw, kind, *, label):
+            return types.SimpleNamespace(path=raw)
+
+        patcher = mock.patch.object(kernel_sandbox, "admit_path", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        handle = offline_home.use_synthetic_home()
+        self.addCleanup(handle.close)
+        handle.real = real             # the stand-in, not the operator's home
+        return handle
+
+    def test_a_replaced_wrapper_fails_mark_loudly(self):
+        handle = self.installed_handle(self.stand_in_home())
+        handle.mark()                  # the wrapper is in place: quiet
+        with mock.patch.object(kernel_sandbox, "admit_path",
+                               lambda raw, kind, *, label: None):
+            with self.assertRaises(AssertionError) as ctx:
+                handle.mark()
+        self.assertIn("recorder", str(ctx.exception))
+        handle.mark()                  # restored: quiet again
+
+    def test_a_stopped_wrapper_fails_mark_loudly(self):
+        handle = self.installed_handle(self.stand_in_home())
+        handle.close()                 # undoes the patch, as a stop would
+        with self.assertRaises(AssertionError):
+            handle.mark()
+
+    def test_zero_admissions_over_a_module_pass(self):
+        handle = self.installed_handle(self.stand_in_home())
+        handle.mark()                  # tests ran, none reached the fence
+        self.assertEqual(handle.admitted, [])
+        handle.assert_module_hermetic()
+        handle.close()                 # no raise
+        if not offline_home._state["armed"]:   # the runner's home outlives it
+            self.assertFalse(os.path.lexists(handle.home))
+
+    def test_the_wrapper_records_what_reaches_it(self):
+        real = self.stand_in_home()
+        handle = self.installed_handle(real)
+        inside = os.path.join(real, ".claude.json")
+        kernel_sandbox.admit_path(inside, "literal", label="probe")
+        kernel_sandbox.admit_path(handle.home, "subpath", label="probe")
+        self.assertEqual(handle.admitted, [inside, handle.home])
+
+    def test_an_unmarked_admission_under_the_real_home_fails_the_module(self):
+        real = self.stand_in_home()
+        handle = self.installed_handle(real)
+        inside = os.path.join(real, ".claude.json")
+        # An admission that no mark() covers: a class that never marked made
+        # it, and a later test marked past it. The per-test check misses it.
+        handle.admitted.append(inside)
+        handle.mark()
+        self.assertEqual(handle.real_home_admissions(), [])
+        with self.assertRaises(AssertionError) as ctx:
+            handle.assert_module_hermetic()
+        self.assertIn(inside, str(ctx.exception))
+        # Admissions under the synthetic home alone are fine.
+        clean = offline_home.SyntheticHome("/synthetic/stand-in", real)
+        clean.admitted.append("/synthetic/stand-in/.claude.json")
+        clean.assert_module_hermetic()
+
+    def test_a_marked_test_is_blamed_and_the_module_check_sees_it_too(self):
+        real = self.stand_in_home()
+        handle = offline_home.SyntheticHome("/synthetic/stand-in", real)
+        inside = os.path.join(real, ".claude.json")
+        case = self.make_case(handle, inside)
+        result = unittest.TextTestResult(io.StringIO(), True, 1)
+        case.run(result)
+        self.assertFalse(result.wasSuccessful())
+        with self.assertRaises(AssertionError):
+            handle.assert_module_hermetic()
+
+    def test_account_variables_are_gone_during_and_back_after(self):
+        real = self.stand_in_home()
+        seeded = {"CLAUDE_CONFIG_DIR": os.path.join(real, ".claude"),
+                  "CLAUDE_CONFIG_DIR_WORK": os.path.join(real, ".claude-work"),
+                  "CODEX_HOME": os.path.join(real, ".codex"),
+                  "XDG_CONFIG_HOME": os.path.join(real, ".config")}
+        env = _clean_env()
+        env.update(seeded)
+        names = sorted(seeded) + ["XDG_DATA_HOME"]
+        proc, out = self.child(_ACCOUNT_ENV, json.dumps(names), env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        got = json.loads(out[-1])
+        for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR_WORK", "CODEX_HOME"):
+            self.assertEqual(got["before"][name], seeded[name])
+            self.assertIsNone(got["during"][name], name)
+        self.assertTrue(got["during"]["XDG_CONFIG_HOME"].startswith(got["fake"]))
+        self.assertTrue(got["during"]["XDG_DATA_HOME"].startswith(got["fake"]))
+        self.assertEqual(got["home"], got["fake"])
+        self.assertEqual(got["after"], got["before"])      # restored, XDG too
+        self.assertFalse(got["exists"], "the home outlived close()")
+
+
+class TestDirectModeChildren(unittest.TestCase):
+    """``use_synthetic_home`` arms Python children when the runner is not used.
+
+    Each case runs in a fresh interpreter (a child ``python3``) whose "real"
+    home is a stand-in temp directory; nothing here reads the operator's home.
+    """
+
+    def stand_in_home(self):
+        tmp = tempfile.TemporaryDirectory(prefix="omni_guard_real_")
+        self.addCleanup(tmp.cleanup)
+        real = os.path.realpath(tmp.name)
+        with open(os.path.join(real, ".claude.json"), "w") as fh:
+            fh.write("{}\n")
+        return real
+
+    def drop(self, home):
+        # Only a home made by a child of this very test.
+        if home and os.path.basename(home).startswith("omni_offline_home_"):
+            shutil.rmtree(home, ignore_errors=True)
+
+    def run_scenario(self, scenario, spec, env=None):
+        proc = subprocess.run(
+            [sys.executable, "-c", _script(_DIRECT), scenario, json.dumps(spec)],
+            cwd=ROOT, env=env or _clean_env(), capture_output=True, text=True,
+            timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        for part in (out, out.get("first"), out.get("second")):
+            if part:
+                self.addCleanup(self.drop, part.get("home"))
+        return out
+
+    def test_a_python_child_sees_the_synthetic_home(self):
+        # Positive control: without the arming this prints the real home.
+        out = self.run_scenario("child", {"real": self.stand_in_home(),
+                                          "code": _HOME_CODE})
+        self.assertEqual(out["child"]["rc"], 0, out["child"])
+        self.assertEqual(out["child"]["out"], out["home"])
+        self.assertIsNone(out["verdict"])
+        self.assertEqual(out["rows"], [])
+        self.assertFalse(out["exists_after"], "the home outlived close()")
+
+    def test_a_child_admission_under_the_real_home_fails_the_module(self):
+        out = self.run_scenario("child", {"real": self.stand_in_home(),
+                                          "code": _ADMIT_CODE})
+        self.assertEqual(out["child"]["rc"], 0, out["child"])
+        self.assertIn([None, "child:admit:c", ".claude.json"], out["rows"])
+        self.assertIsNotNone(out["verdict"])
+        self.assertIn("child:admit:c", out["verdict"])
+        self.assertIn(".claude.json", out["verdict"])
+
+    def test_a_child_that_cannot_arm_fails_the_module(self):
+        # PYTHONPATH reaches sitecustomize but not the repository root, so
+        # the import of tests.offline_home fails inside it.
+        out = self.run_scenario("child", {
+            "real": self.stand_in_home(), "code": "pass",
+            "env": {"PYTHONPATH": offline_home.SITE_DIR},
+            "cwd": tempfile.gettempdir()})
+        self.assertEqual(out["child"]["rc"], 0, out["child"])
+        failed = [r for r in out["rows"] if r[1] == "child:arm_failed"]
+        self.assertEqual(len(failed), 1, out["rows"])
+        self.assertIn("No module named", failed[0][2])
+        self.assertIsNotNone(out["verdict"])
+        self.assertIn("could not arm", out["verdict"])
+
+    def test_a_malformed_log_row_is_reported_not_skipped(self):
+        real = self.stand_in_home()
+        handle = offline_home.SyntheticHome("/synthetic/stand-in", real)
+        handle.log = os.path.join(real, "hits.jsonl")
+        with open(handle.log, "w") as fh:
+            fh.write("not json\n")
+            fh.write(json.dumps(["t", "open", ".ssh/id_rsa", 1]) + "\n")
+            fh.write(json.dumps(["short"]) + "\n")
+        rows = handle.child_rows()
+        self.assertEqual([r[1] for r in rows],
+                         ["child:log_malformed", "child:open",
+                          "child:log_malformed"])
+        with self.assertRaises(AssertionError) as ctx:
+            handle.assert_module_hermetic()
+        self.assertIn("unreadable row", str(ctx.exception))
+
+    def test_the_exported_variables_are_restored_by_close(self):
+        names = [offline_home.ENV_HOME, offline_home.ENV_REAL,
+                 offline_home.ENV_LOG, "PYTHONPATH"]
+        real = self.stand_in_home()
+        seeds = {
+            "set": {offline_home.ENV_HOME: "marker-home",
+                    offline_home.ENV_REAL: "marker-real",
+                    offline_home.ENV_LOG: "marker-log",
+                    "PYTHONPATH": os.pathsep.join(["/marker/one", "/marker/two"])},
+            "unset": {name: None for name in names},
+        }
+        for tag, seed in seeds.items():
+            out = self.run_scenario("restore", {"real": real, "seed": seed})
+            self.assertEqual(out["before"], seed, tag)
+            self.assertEqual(out["after"], out["before"], tag)
+            during = out["during"]
+            self.assertEqual(during[offline_home.ENV_HOME], out["home"], tag)
+            self.assertEqual(during[offline_home.ENV_REAL], real, tag)
+            self.assertEqual(during[offline_home.ENV_LOG], out["log"], tag)
+            self.assertTrue(out["log"].startswith(out["home"] + os.sep), tag)
+            expected = [offline_home.SITE_DIR, ROOT]
+            if seed["PYTHONPATH"]:
+                expected += seed["PYTHONPATH"].split(os.pathsep)
+            self.assertEqual(during["PYTHONPATH"].split(os.pathsep), expected,
+                             tag)
+
+    def test_under_the_runner_nothing_is_exported_and_its_log_is_ignored(self):
+        out = self.run_scenario("runner", {"real": self.stand_in_home(),
+                                           "code": _ADMIT_CODE})
+        self.assertEqual(out["home"], out["runner_home"])
+        self.assertTrue(out["same_env"], "the handle exported something new")
+        self.assertIsNone(out["log"])
+        self.assertEqual(out["child"]["rc"], 0, out["child"])
+        # The runner's child did write to the runner's log, and the runner
+        # still reports it ...
+        self.assertIn([None, "child:admit:c", ".claude.json"],
+                      out["runner_rows"])
+        # ... but the handle does not read that log.
+        self.assertIsNone(out["verdict"], out["verdict"])
+        self.assertTrue(out["after_close_same_env"])
+        self.assertTrue(out["runner_home_exists"],
+                        "close() removed the runner's home")
+
+    def test_two_handles_in_sequence_do_not_leak_into_each_other(self):
+        out = self.run_scenario("sequence", {"real": self.stand_in_home(),
+                                             "code": _ADMIT_CODE,
+                                             "clean_code": _HOME_CODE})
+        first, second = out["first"], out["second"]
+        self.assertEqual(first["env_log"], first["log"])
+        self.assertEqual(second["env_log"], second["log"])
+        self.assertNotEqual(first["log"], second["log"])
+        self.assertNotEqual(first["home"], second["home"])
+        self.assertIsNotNone(first["verdict"])
+        self.assertIn("child:admit:c", first["verdict"])
+        self.assertFalse(first["exists_after"])
+        self.assertEqual(second["rows"], [])
+        self.assertIsNone(second["verdict"])
+        self.assertEqual(second["child"]["out"], second["home"])
+        self.assertIsNone(second["verdict_after_child"])
 
 
 class TestRunnerCleanup(unittest.TestCase):

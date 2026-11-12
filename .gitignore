@@ -10,3 +10,8 @@ graphify-out/
 # in whatever cwd it started in -- including a worktree. It reached main
 # once through `git add -A`.
 ${CLAUDE_PLUGIN_DATA}/
+
+# Build output from pip/pipx installs.
+build/
+dist/
+*.egg-info/

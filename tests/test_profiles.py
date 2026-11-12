@@ -38,6 +38,30 @@ from providers.profiles import (
     validate_profile_ring_env,
 )
 from tests.test_agent import FakeRunCli, depth, patched_lane
+from tests import offline_home
+
+
+_HOME = None
+_STATE_PATCH = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module. It goes
+    # first (and closes last): that helper scrubs the import-time state-dir pin.
+    global _HOME, _STATE_PATCH
+    _HOME = offline_home.use_synthetic_home()
+    _STATE_PATCH = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": _TMP})
+    _STATE_PATCH.start()
+
+
+def tearDownModule():
+    try:
+        _STATE_PATCH.stop()
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 CURSOR_OK = json.dumps({
@@ -465,6 +489,10 @@ class TestProfileRingParse(unittest.TestCase):
 
 
 class TestCodexConsultProfile(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_a_alt_sets_codex_home_and_strips_siblings(self):
         fake = FakeRunCli(out_file_text="PONG")
         d = tempfile.mkdtemp(prefix="omni_prof_a_")
@@ -552,6 +580,10 @@ class TestCodexConsultProfile(unittest.TestCase):
 
 
 class TestCursorConsultProfile(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _run(self, fake, account_profile, extra_env):
         env = dict(os.environ)
         env.update(extra_env)
@@ -588,6 +620,11 @@ class TestCursorConsultProfile(unittest.TestCase):
 
 
 class TestLoudRefuseOtherRoads(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_f_route_refuses_without_spawn(self):
         spawned = []
 
@@ -667,6 +704,10 @@ class TestLoudRefuseOtherRoads(unittest.TestCase):
 
 
 class TestWriteAllowPaths(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_j_extra_write_paths_grows_by_one(self):
         d = tempfile.mkdtemp(prefix="omni_prof_j_")
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
@@ -718,6 +759,10 @@ class TestCodexHomeGuard(unittest.TestCase):
 
 
 class TestClaudeConsultProfile(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_alt_sets_config_dir_and_strips_siblings(self):
         fake = FakeRunCli(stdout=CLAUDE_OK)
         d = tempfile.mkdtemp(prefix="omni_prof_claude_a_")
@@ -820,6 +865,10 @@ class TestClaudeConsultProfile(unittest.TestCase):
 
 
 class TestClaudeAgentLaneProfile(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def test_agent_lane_keeps_config_dir(self):
         fake = FakeRunCli(stdout=CLAUDE_OK)
         d = tempfile.mkdtemp(prefix="omni_prof_claude_h_")

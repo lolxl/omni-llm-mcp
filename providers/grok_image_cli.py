@@ -6,15 +6,31 @@ import shutil
 import subprocess
 import tempfile
 
-from providers import cli_run, known_secrets
+from providers import admission, cli_run, known_secrets
 from providers.config import DEFAULT_TIMEOUT_S, GROK_EXTRA_AUTH_MARKERS
 from providers.egress_gate import refuse_payload
 from providers.host_fence import HostFenceError, prepare_host_fence
 from providers.errors import classify_cli_error, exception_detail, safe_detail
 from providers import vendor_bin
 
+# R11 default. The request's model argument is not used by this backend.
+GROK_IMAGE_MODEL = "grok-4.7"
 
-async def run_grok_image_edit(prompt, source_image, timeout_s=DEFAULT_TIMEOUT_S, out_dir=None, account_profile="default"):
+
+def _image_argv(grok, cli_prompt, decision):
+    """Today's gate keeps ``grok -p``. A catalog admission adds ``-m`` and effort."""
+    argv = [grok, "-p", cli_prompt]
+    if not isinstance(decision, dict) or decision.get("gate") != "catalog":
+        return argv
+    argv.extend(["-m", decision.get("model") or GROK_IMAGE_MODEL])
+    effort = decision.get("effort")
+    if effort:
+        argv.extend(["--reasoning-effort", str(effort)])
+    return argv
+
+
+async def run_grok_image_edit(prompt, source_image, timeout_s=DEFAULT_TIMEOUT_S, out_dir=None, account_profile="default",
+                             apply_aliases=False):
     if not str(source_image or "").strip():
         return {"ok": False, "reason": "runtime_error", "detail": "source_image is required for grok image_edit (it edits a reference image)"}
     grok = vendor_bin.which("grok")
@@ -35,11 +51,20 @@ async def run_grok_image_edit(prompt, source_image, timeout_s=DEFAULT_TIMEOUT_S,
     if denied:
         return denied
 
+    # The adapter runs on the process environment, whatever account_profile is.
+    # Alias admission is opt-in. Dispatch's image path passes the flag.
+    # The egress canary calls this seam without it and stays on the built-in.
+    decision = admission.consider(
+        "grok", "default", GROK_IMAGE_MODEL, None, host_env=os.environ,
+        apply_aliases=apply_aliases, alias_image=True)
+    if decision.get("refusal"):
+        return admission.refusal_envelope("grok", "default", decision)
+
     source_path = os.path.expanduser(str(source_image))
     if not os.path.isabs(source_path):
         source_path = os.path.join(base_out, source_path)
     source_path = os.path.abspath(source_path)
-    argv = [grok, "-p", cli_prompt]
+    argv = _image_argv(grok, cli_prompt, decision)
     try:
         argv, child_env, _fence_meta = prepare_host_fence(
             argv, provider="grok", workdir=base_out,
@@ -72,4 +97,6 @@ async def run_grok_image_edit(prompt, source_image, timeout_s=DEFAULT_TIMEOUT_S,
         return {"ok": False, "reason": reason, "detail": safe_detail(err or out or "exit %d" % proc.returncode)}
     if not os.path.exists(out_path):
         return {"ok": False, "reason": "empty_response", "detail": safe_detail(err or out or "grok produced no image at %s" % out_path)}
-    return {"ok": True, "model": "grok-image-edit", "images": [{"path": out_path}], "n": 1}
+    return admission.stamp(
+        {"ok": True, "model": "grok-image-edit", "images": [{"path": out_path}], "n": 1},
+        decision)

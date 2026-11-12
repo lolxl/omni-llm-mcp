@@ -255,31 +255,14 @@ class TestModelCatalogCli(unittest.TestCase):
         self.assertEqual(json.loads(out), refresh_result)
         self.assertEqual(call.call_args.args, ("agy", "work", 9))
 
-        check_result = {"ok": True, "exit_code": 3, "drift": True}
+        check_result = {"ok": False, "exit_code": 2}
         code, out, _call = self.run_catalog(
             ["models", "check", "--provider", "cursor", "--profile", "work"],
             "check", check_result)
-        self.assertEqual(code, 3)
+        self.assertEqual(code, 2)
         self.assertEqual(json.loads(out), check_result)
 
-    def test_import_snapshot_and_schedule_use_explicit_paths_and_profiles(self):
-        imported = {"ok": True, "source": "manual"}
-        code, out, call = self.run_catalog(
-            ["models", "import", "--provider", "claude", "--profile", "alt",
-             "--file", "/tmp/catalog.json"], "manual_import", imported)
-        self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out), imported)
-        self.assertEqual(call.call_args.args,
-                         ("claude", "alt", "/tmp/catalog.json"))
-
-        snapshot = {"ok": True, "output": "/tmp/snapshot.json"}
-        code, _out, call = self.run_catalog(
-            ["models", "snapshot", "--output", "/tmp/snapshot.json"],
-            "snapshot", snapshot)
-        self.assertEqual(code, 0)
-        self.assertEqual(call.call_args.args,
-                         ("/tmp/snapshot.json", "all", None))
-
+    def test_schedule_uses_explicit_paths_and_profiles(self):
         code, out, call = self.run_catalog(
             ["models", "schedule", "--print", "--profile", "work",
              "--provider", "codex", "--interval", "86400"], "schedule_plist",

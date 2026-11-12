@@ -20,6 +20,22 @@ from unittest import mock
 from providers import (agent_lane, agy, artifacts, claude, dispatch, metrics, codex, cursor, errors, grok,
                        health, kernel_sandbox, host_fence, openai_compat, pi,
                        sandbox_canary, xai_image)
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 KEY = "sk-" + "A1b2C3d4E5" * 2          # sk- + 20 alphanumerics
 PATH_WORD = "login-auth-token"           # AUTH_MARKERS fodder inside a path
@@ -36,6 +52,8 @@ def _assert_redacted(case, res, key=KEY):
 
 class Env(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         temp = tempfile.TemporaryDirectory(prefix="omni-148-")
         self.addCleanup(temp.cleanup)
         self.root = os.path.realpath(temp.name)

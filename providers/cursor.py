@@ -190,6 +190,30 @@ def envelope_model(model):
     return "cursor/%s" % alias_model(model)
 
 
+@local_before_spawn
+async def run_cursor_subprocess(prompt, model, timeout_s, account_profile="default",
+                                effort=None, scrub_siblings=False, _spawn=None,
+                                apply_aliases=False):
+    """Admit against the account record, then run the ask-mode CLI.
+
+    Cursor has no today's gate. The decision's model is the slug; the old
+    alias and default-effort fill do not run on an admitted attempt.
+    ``apply_aliases`` is passed only by dispatch. Probes and canaries omit it.
+    """
+    from providers import admission
+    decision = admission.consider(
+        "cursor", account_profile, model, effort, isolated=False,
+        host_env=os.environ, settings_files=(), apply_aliases=apply_aliases)
+    if admission.is_terminal(decision):
+        return admission.refusal_envelope("cursor", account_profile, decision)
+    run_model, _run_effort, catalog = admission.bound_call(model, effort, decision)
+    result = await _run_cursor_body(
+        prompt, run_model, timeout_s, account_profile,
+        effort=None if catalog else effort, scrub_siblings=scrub_siblings,
+        _spawn=_spawn, admitted=catalog)
+    return admission.stamp(result, decision)
+
+
 def consult_argv(cursor_bin, model, workspace):
     """Headless Ask-mode argv. Prompt arrives on stdin.
 
@@ -207,18 +231,20 @@ def consult_argv(cursor_bin, model, workspace):
     ]
 
 
-@local_before_spawn
-async def run_cursor_subprocess(prompt, model, timeout_s, account_profile="default",
-                                effort=None, scrub_siblings=False, _spawn=None):
+async def _run_cursor_body(prompt, model, timeout_s, account_profile="default",
+                           effort=None, scrub_siblings=False, _spawn=None,
+                           admitted=False):
     """Pipe prompt -> `cursor-agent -p --mode ask` -> typed envelope.
 
-    ``effort`` is folded into the model slug before anything else runs, so a
+    ``admitted`` means the model is already the catalog slug. Otherwise
+    ``effort`` is folded into the slug before anything else runs, so a
     base/token pair the catalog cannot express stays LOUD unsupported_effort
     even when the CLI is missing (cli_missing must not mask a token error).
     """
-    model, effort_err = resolve_model(model, effort, account_profile)
-    if effort_err:
-        return effort_err
+    if not admitted:
+        model, effort_err = resolve_model(model, effort, account_profile)
+        if effort_err:
+            return effort_err
     overrides, profile_err = resolve_profile("cursor", account_profile)
     if profile_err:
         return profile_err

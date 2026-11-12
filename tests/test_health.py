@@ -31,6 +31,7 @@ os.environ.pop("OMNI_LLM_NOTIFY_CMD", None)
 
 from providers import dispatch  # noqa: E402
 from providers import health  # noqa: E402
+from providers.config import FABLE_MODEL  # noqa: E402
 
 _real_account_identity = health._account_identity
 _account_identity_patcher = mock.patch.object(
@@ -86,7 +87,7 @@ class PoolKeyTest(unittest.TestCase):
     def test_cursor_other_models_share_one_key(self):
         keys = [
             health.pool_key("cursor/gpt-5.6-sol-high", "default"),
-            health.pool_key("cursor/claude-fable-5-1", "default"),
+            health.pool_key("cursor/" + FABLE_MODEL, "default"),
             health.pool_key("cursor/fable", "default"),
             health.pool_key("cursor/sol", "default"),
         ]
@@ -2806,6 +2807,46 @@ class RedirectedLedgerPathTest(unittest.TestCase):
             resolved = os.path.abspath(path)
             self.assertNotEqual(resolved, default_root, resolved)
             self.assertFalse(resolved.startswith(prefix), resolved)
+
+
+class AliasTargetPoolTests(unittest.TestCase):
+    """A retargeted cursor/sol cooldown lands on the effective model's pool."""
+
+    def tearDown(self):
+        try:
+            health.clear("cursor/sol", "aliasq")
+        except Exception:
+            pass
+        path = os.path.join(os.environ["OMNI_LLM_STATE_DIR"], "aliases.json")
+        if os.path.lexists(path):
+            os.unlink(path)
+
+    def test_retargeted_sol_cooldown_uses_the_effective_pool(self):
+        from providers import aliases
+        self.assertEqual(
+            health.pool_key("cursor/sol", "aliasq"), "cursor:other-models@aliasq")
+        aliases.set_alias("family.sol.cursor", "composer-2.5")
+        self.assertEqual(
+            health.pool_key("cursor/sol", "aliasq"), "cursor:cursor-models@aliasq")
+        self.assertEqual(
+            health.pool_key("cursor/sol", "aliasq"),
+            health.pool_key("cursor/composer-2.5", "aliasq"))
+        health.flag("cursor/sol", "aliasq", source="manual")
+        self.assertIn("cursor:cursor-models@aliasq", health.snapshot())
+        self.assertEqual(
+            health.pool_key("cursor/fable", "aliasq"), "cursor:other-models@aliasq")
+
+    def test_sol_retargeted_to_auto_shares_the_auto_pool(self):
+        from providers import aliases
+        aliases.set_alias("family.sol.cursor", "auto")
+        self.assertEqual(
+            health.pool_key("cursor/sol", "aliasq"),
+            health.pool_key("cursor/auto", "aliasq"))
+        self.assertEqual(
+            health.pool_key("cursor/sol", "aliasq"), "cursor:auto@aliasq")
+        health.flag("cursor/sol", "aliasq", source="manual")
+        self.assertIn("cursor:auto@aliasq", health.snapshot())
+        self.assertNotIn("cursor:other-models@aliasq", health.snapshot())
 
 
 if __name__ == "__main__":

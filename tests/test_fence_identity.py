@@ -16,6 +16,22 @@ import unittest
 from unittest import mock
 
 from providers import agent_lane, kernel_sandbox
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 def _rmtree(path):
@@ -43,6 +59,10 @@ def _plant_same_inode_ancestor(mid):
 
 
 class TestFenceIdentity(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def _fake_home(self):
         home = _canonical_tempdir("omni120a_home_")
         self.addCleanup(_rmtree, home)

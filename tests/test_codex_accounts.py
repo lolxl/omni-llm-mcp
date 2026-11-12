@@ -11,6 +11,48 @@ import unittest
 from unittest import mock
 
 from providers import codex_accounts as accounts, health
+from tests import offline_home
+
+# Seeds v2 records; tests/offline_home.py gives this module the real gate.
+OMNI_TEST_REAL_ADMISSION = True
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
+
+def _seed_codex(*models, profiles=("default", "a", "b", "c")):
+    """Write a v2 record for the current codex homes. Call after the env the attempt fingerprints."""
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    if not models:
+        models = ("synthetic-model",)
+    items = [{
+        "id": model,
+        "name": model,
+        "routable_id": "codex/%s" % model,
+        "supported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+    } for model in models]
+    record, _warnings = validate_strict("codex", {
+        "provider": "codex",
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": items,
+    })
+    for profile in profiles:
+        catalog_v2.save("codex", profile, record)
 
 
 def event_error(message=None, code=None):
@@ -33,6 +75,8 @@ def available(used=10, secondary=None):
 
 class AccountCase(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         temp = tempfile.TemporaryDirectory(prefix="omni-accounts-")
         self.addCleanup(temp.cleanup)
         self.root = os.path.realpath(temp.name)
@@ -50,6 +94,7 @@ class AccountCase(unittest.TestCase):
         patch = mock.patch.object(health, "_account_identity", return_value=None)
         patch.start()
         self.addCleanup(patch.stop)
+        _seed_codex("synthetic-model", "synthetic-a", "synthetic-second")
 
     def selection(self, **kwargs):
         os.environ["OMNI_LLM_PROFILES_CODEX"] = "a,b"
@@ -529,6 +574,7 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
             self.assertIsNone(kwargs["config_dir"])
             return argv, kwargs["env"], {"fence": "none"}
         with mock.patch("providers.kernel_sandbox.protected_home", return_value=self.root), mock.patch.object(codex.shutil, "which", return_value="/synthetic/codex"), mock.patch.object(codex, "prepare_host_fence", side_effect=prepared), mock.patch.object(codex.kernel_sandbox, "admit_vendor_binary", return_value=None), mock.patch.object(codex, "run_cli", side_effect=runner):
+            _seed_codex(profiles=("default",))
             result = asyncio.run(codex.run_codex_subprocess("synthetic task", "synthetic-model", 5))
         self.assertTrue(result["ok"])
         self.assertEqual(called[0][1]["env"]["CODEX_HOME"], home)
@@ -570,6 +616,7 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
             return argv, kwargs["env"], {"fence": "none"}
         called, runner = self.fake_runner()
         with mock.patch("providers.kernel_sandbox.protected_home", return_value=protected), mock.patch.object(codex.shutil, "which", return_value="/synthetic/codex"), mock.patch.object(codex, "prepare_host_fence", side_effect=prepared), mock.patch.object(codex.kernel_sandbox, "admit_vendor_binary", return_value=None), mock.patch.object(codex, "run_cli", side_effect=runner):
+            _seed_codex()
             result = asyncio.run(codex.run_codex_subprocess("synthetic task", "synthetic-model", 5))
         self.assertTrue(result["ok"], result)
         wrap_kw = policies[0]["wrap_kw"]
@@ -600,6 +647,7 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
         os.environ["OMNI_LLM_PROFILES_CODEX"] = "default"
         called, runner = self.fake_runner()
         with mock.patch("providers.kernel_sandbox.protected_home", return_value=protected), mock.patch.object(codex.shutil, "which", return_value="/synthetic/codex"), mock.patch.object(codex, "prepare_host_fence") as prepared, mock.patch.object(codex.kernel_sandbox, "admit_vendor_binary", return_value=None), mock.patch.object(codex, "run_cli", side_effect=runner):
+            _seed_codex()
             result = asyncio.run(codex.run_codex_subprocess("synthetic task", "synthetic-model", 5))
         self.assertEqual(result.get("reason"), "fence_path_rejected", result)
         prepared.assert_not_called()
@@ -683,6 +731,7 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
             self.assertIsNone(kwargs["config_dir"])
             return {"ok": True, "vendor_state_writable": True}
         with self.host_fence_patches(), mock.patch.object(agent_lane, "run_cli", side_effect=runner), mock.patch.object(agent_lane.shutil, "which", return_value="/synthetic/codex"), mock.patch.object(agent_lane, "_workdir_fence", return_value=None), mock.patch.object(agent_lane, "_workspace_snapshot", return_value={}), mock.patch.object(agent_lane, "_workspace_writes", return_value=(0, None)), mock.patch.object(kernel_sandbox, "agent_fence_policy", side_effect=policy) as admission, mock.patch.object(kernel_sandbox, "wrap_kwargs_from_policy", return_value={"read_wall": True}):
+            _seed_codex(profiles=("default",))
             result = asyncio.run(agent_lane.run_agent("synthetic task", "codex/synthetic-model", self.root,
                                                        read_only=True, timeout_s=5))
         self.assertTrue(result["ok"])
@@ -696,6 +745,7 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
         os.environ["OMNI_LLM_PROFILES_CODEX"] = "default"
         called, runner = self.fake_runner()
         with self.host_fence_patches(), mock.patch.object(codex.shutil, "which", return_value="/synthetic/codex"), mock.patch.object(codex, "run_cli", side_effect=runner), mock.patch.object(kernel_sandbox, "admit_vendor_binary", return_value=None), mock.patch.object(codex, "prepare_host_fence", wraps=host_fence.prepare_host_fence) as prepared:
+            _seed_codex(profiles=("default",))
             result = asyncio.run(codex.run_codex_subprocess("synthetic task", "synthetic-model", 5))
         self.assertTrue(result["ok"])
         self.assertIsNone(prepared.call_args.kwargs["config_dir"])
@@ -1020,6 +1070,7 @@ sys.exit(1)
             health.clear_all()
             os.environ["CODEX_HOME"] = self.homes["a"]
             os.environ["OMNI_LLM_PROFILES_CODEX"] = ("default,b" if profile == "default" else "a,b")
+            _seed_codex()
             capture.write_text("", encoding="utf-8")
             origin = self.job_start()
             self.assertNotIn("refused", origin)

@@ -21,6 +21,22 @@ from providers import dispatch
 from providers import grok as grok_mod
 from providers import openai_compat
 from providers.egress_gate import refuse_payload
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 # Synthetic only. Same dummy Taiwan mobile the consult-gate tests already use.
@@ -59,6 +75,10 @@ class TestBareRunDefaultOff(unittest.TestCase):
     Consult hooks exist (openai_compat.py:50, grok.py:261, dispatch.py:642)
     but they no-op when the env switch is not exactly '1'.
     """
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def test_unset_gate_refuse_payload_is_none(self):
         # CURRENT-BEHAVIOR: default-off consult switch does not scan.

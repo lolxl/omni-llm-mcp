@@ -91,6 +91,13 @@ class ProviderReviewRegressions(unittest.TestCase):
                'OMNI_LLM_CHILD_ENV_PASS': 'REGRESSION_CASE,FAKE_OUTPUT,FAKE_RC',
                'PROVIDER_REVIEW_ARTIFACT_DIR': os.environ.get('PROVIDER_REVIEW_ARTIFACT_DIR', ''),
                'OMNI_LLM_CLAUDE_BIN': str(self.case/'bin'/'claude')}
+        # clear=True would drop the offline runner's child arming, so the job
+        # child would run the real admission gate. Keep the arming vars.
+        for key in ("PYTHONPATH", "OMNI_OFFLINE_HOME", "OMNI_OFFLINE_REAL_HOME",
+                    "OMNI_OFFLINE_HITLOG", "OMNI_OFFLINE_CURRENT",
+                    "OMNI_OFFLINE_REAL_ADMISSION"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
         # Registered account homes must be disjoint across providers.
         for key, prefix in (('CLAUDE_CONFIG_DIR', ''), ('GROK_HOME', 'grok-')):
             for label in ('a', 'b'):

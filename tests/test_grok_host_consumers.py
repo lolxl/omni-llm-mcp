@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -11,7 +12,45 @@ from providers import grok, grok_image_cli
 from providers.host_fence import HostFenceError
 
 
+def _seed_grok(rows):
+    """Write a grok v2 record. ``rows`` is ``(id, supported_efforts)``."""
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    record, _warnings = validate_strict("grok", {
+        "provider": "grok",
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": [{
+            "id": model_id,
+            "name": model_id,
+            "routable_id": "grok/%s" % model_id,
+            "supported_efforts": list(efforts),
+        } for model_id, efforts in rows],
+    })
+    catalog_v2.save("grok", "default", record)
+
+
+def _seed_grok_image():
+    from providers.grok_image_cli import GROK_IMAGE_MODEL
+    _seed_grok([(GROK_IMAGE_MODEL, ["medium"])])
+
+
+def _pin_state(case):
+    state = tempfile.mkdtemp(prefix="grok-admit-")
+    case.addCleanup(shutil.rmtree, state, True)
+    env = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": state})
+    env.start()
+    case.addCleanup(env.stop)
+
+
 class GrokTextHostFenceTests(unittest.TestCase):
+    def setUp(self):
+        # Plain unittest uses the real gate. The text lane admits fixture-model
+        # before the fence; today's gate ignores this row.
+        _pin_state(self)
+        _seed_grok([("fixture-model", ["low", "medium", "high"])])
+
     def test_text_cli_receives_prepared_argv_and_env(self):
         captured = {}
         grok_home = tempfile.mkdtemp(prefix="grok-host-test-home-")
@@ -73,11 +112,29 @@ class GrokTextHostFenceTests(unittest.TestCase):
                 mock.patch.object(grok, "run_cli", run_cli):
             result = asyncio.run(grok.run_grok_subprocess("fixture prompt", "fixture-model", 5))
 
-        self.assertEqual(result, refusal.envelope)
+        expected = dict(refusal.envelope)
+        # Consult now runs through the account ring, which marks a final
+        # unmanaged failure account_retry_safe. Today's gate keeps its note;
+        # a catalog admission discloses the folded effort.
+        expected["account_retry_safe"] = False
+        if result.get("effort_source") == "today_gate":
+            expected["effort"] = None
+            expected["effort_source"] = "today_gate"
+            expected["effort_note"] = "effort: (today's gate)"
+        else:
+            expected["effort"] = "medium"
+            expected["effort_source"] = "omni_default"
+            expected["effort_note"] = (
+                "effort: medium (chosen by omni; no effort was given)")
+        self.assertEqual(result, expected)
         run_cli.assert_not_awaited()
 
 
 class GrokImageHostFenceTests(unittest.TestCase):
+    def setUp(self):
+        _pin_state(self)
+        _seed_grok_image()
+
     def test_image_cli_limits_declared_paths_and_receives_prepared_command(self):
         with tempfile.TemporaryDirectory(prefix="grok-host-test-") as root:
             out_dir = os.path.join(root, "out")

@@ -8,6 +8,22 @@ import tempfile
 import unittest
 
 from providers import host_fence, kernel_sandbox
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 _WRITE = """
@@ -46,6 +62,10 @@ class ReadonlyProfileTests(unittest.TestCase):
 
 @unittest.skipUnless(kernel_sandbox.available(), "macOS Seatbelt required")
 class ReadonlyHostTests(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     def run_write(self, workdir, target, *, read_only, child=False, policy=None):
         command = [sys.executable, "-c", _WRITE, target]
         if child:

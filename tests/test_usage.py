@@ -53,6 +53,26 @@ import json
 import os
 import unittest
 
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
+
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(HERE, "tests", "fixtures")
 
@@ -888,6 +908,10 @@ class TestEmptyReplyStaysLoud(unittest.TestCase):
     answer would come back as `{"ok": true, "text": ""}` — exactly the silent
     success the server's LOUD-failure contract forbids.
     """
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
 
     def _fake_cli(self, stdout):
         async def fake_run_cli(argv, **kwargs):

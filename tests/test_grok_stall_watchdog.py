@@ -26,21 +26,30 @@ if HERE not in sys.path:
 
 from providers import agent_lane, cli_run, config as config_mod  # noqa: E402
 from providers import known_secrets, stream_contract  # noqa: E402
+from tests import offline_home  # noqa: E402
 
 _REAL_WHICH = shutil.which
 _REAL_RUN_CLI = cli_run.run_cli
 # Timeout envelope keys at base: nothing grok-specific.
 BASE_TIMEOUT_KEYS = {"ok", "reason", "detail", "workspace_writes", "fence",
-                     "fence_detail", "account_retry_safe"}
+                     "fence_detail", "account_retry_safe",
+                     "effort", "effort_source", "effort_note"}
 BASE_RUN_CLI_KEYS = {"returncode", "stdout", "stderr", "timed_out", "watched",
                      "signal"}
 SECRET = "mZ4qT9vL" + "2xW7pR5n" + "K8dJ3hB6"
 
 _STATE_PATCH = None
 _STATE_DIR = None
+_HOME = None
 
 
 def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module. It goes
+    # first (and closes last): the state-dir patch below must not be scrubbed.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
     global _STATE_PATCH, _STATE_DIR
     _STATE_DIR = tempfile.mkdtemp(prefix="omni_state_")
     _STATE_PATCH = mock.patch.dict(os.environ, {"OMNI_LLM_STATE_DIR": _STATE_DIR})
@@ -48,8 +57,12 @@ def setUpModule():
 
 
 def tearDownModule():
-    _STATE_PATCH.stop()
-    shutil.rmtree(_STATE_DIR, ignore_errors=True)
+    try:
+        _STATE_PATCH.stop()
+        shutil.rmtree(_STATE_DIR, ignore_errors=True)
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 def _fake_which(name, *a, **kw):
@@ -114,6 +127,8 @@ class Canned:
 @mock.patch("platform.system", new=lambda: "Linux")
 class LaneCase(unittest.TestCase):
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         known_secrets.clear()
         self.addCleanup(known_secrets.clear)
 

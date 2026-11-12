@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from providers import agent_lane, health, jobs, job_runner, provider_accounts
+from tests import offline_home
 
 NATIVE = {"codex": "CODEX_HOME", "claude": "CLAUDE_CONFIG_DIR", "grok": "GROK_HOME"}
 AUTH = ("CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_BASE_URL",
@@ -87,8 +88,28 @@ def failure_stream(provider, tool=False, auth=False):
     return "\n".join(json.dumps(event) for event in events)
 
 
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
+
+
 class ProviderContract:
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         temp = tempfile.TemporaryDirectory(prefix="omni-provider-contract-")
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
@@ -1494,6 +1515,7 @@ reply = table.get(os.path.basename(home or ""), {})
 if "stream-json" in argv and "stdout" not in reply:
     print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "synthetic ok"}]}}))
 print(reply.get("stdout", os.environ["OMNI_SYNTHETIC_DEFAULT"]))
+sys.stderr.write(reply.get("stderr", ""))
 sys.exit(reply.get("rc", 0))
 '''
 
@@ -1594,6 +1616,11 @@ class ApiFixture(unittest.TestCase):
 
 
 class TestKindSelection(ApiFixture):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_t1_cooled_subscription_opens_api_path_consult_and_agent(self):
         for lane in (self.consult, self.agent):
             with self.subTest(lane=lane.__name__):
@@ -1675,6 +1702,11 @@ class TestKindSelection(ApiFixture):
 
 
 class TestCreditClassification(ApiFixture):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_t4_credit_envelope_holds_api_until_cleared(self):
         health.flag(self.model, "a")
         self.respond(api={"stdout": CREDIT_ERROR, "rc": 1})
@@ -2306,6 +2338,12 @@ class TestOlderSuccessKeepsNewerFlag(ApiFixture):
 
 class TestStaleGateAtExecution(ApiFixture):
     """X1: the API permission is re-read from current health at execution."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def submit(self):
         origin = self.start_job()
         self.assertNotIn("refused", origin)
@@ -2362,6 +2400,11 @@ class TestStaleGateAtExecution(ApiFixture):
 
 
 class TestBudgetBackstop(ApiFixture):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_t6_api_children_carry_budget_and_subscription_children_do_not(self):
         health.flag(self.model, "a")
         for lane in (self.consult, self.agent):
@@ -2405,6 +2448,11 @@ class TestBudgetBackstop(ApiFixture):
 
 
 class TestJobLaneKeyDelivery(ApiFixture):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_t7_job_spawn_passes_settings_file_with_only_the_helper(self):
         health.flag(self.model, "a")
         origin, result = self.run_job()
@@ -2546,6 +2594,11 @@ class TestJobLaneKeyDelivery(ApiFixture):
 
 
 class TestLaunchContextScrub(ApiFixture):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_t9_managed_children_drop_launch_context_and_keep_preferences(self):
         for name in LAUNCH_CONTEXT:
             os.environ[name] = "synthetic-" + name
@@ -2586,6 +2639,11 @@ REAL_API_SETTINGS_BASE = agent_lane._api_settings_base
 
 class TestApiSettingsFence(ApiFixture):
     """Q2: the child can neither rewrite nor replace the generated settings."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
 
     real_base = staticmethod(REAL_API_SETTINGS_BASE)
 
@@ -3046,6 +3104,12 @@ class TestApiSettingsBaseValidation(unittest.TestCase):
 
 class TestLateGateRecheck(ApiFixture):
     """S1: the permit is re-read as the last step before the child is created."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     NOTE = "earlier subscription account recovered"
 
     def assert_refused_without_spawn(self, result):
@@ -3200,6 +3264,12 @@ class TestLateGateRecheck(ApiFixture):
 
 class TestApiOptInForPins(ApiFixture):
     """P5: an explicit pin or resume of an api label needs the opt-in too."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def test_pin_is_refused_before_spawn_when_opt_in_is_not_exactly_one(self):
         for value in (None, "0", "true", ""):
             with self.subTest(value=value):
@@ -3245,6 +3315,12 @@ class TestApiOptInForPins(ApiFixture):
 
 class TestHelperRead(ApiFixture):
     """P3: the parent reads apiKeyHelper only from a regular file in the home."""
+
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+        super().setUp()
+
     def write_settings(self, text, home=None):
         Path(home or self.homes["api"], "settings.json").write_text(text)
 

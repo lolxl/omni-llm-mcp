@@ -238,7 +238,10 @@ def _git_version(trusted, env):
     st = os.stat(trusted)
     key = (trusted, st.st_dev, st.st_ino, st.st_mtime_ns)
     if key not in _version_cache:
-        p = subprocess.run(_sandbox_argv(trusted, [trusted, "--version"]),
+        # git_argv, not a private list, so the probe cannot drift from the
+        # global options every other parent git call carries.
+        probe = git_argv(None, ["--version"], git_bin=trusted)
+        p = subprocess.run(_sandbox_argv(trusted, probe),
                            capture_output=True, text=True, env=env, cwd="/",
                            timeout=10, check=False)
         m = re.search(r"git version (\d+)\.(\d+)", p.stdout or "")

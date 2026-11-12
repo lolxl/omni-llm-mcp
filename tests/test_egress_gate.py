@@ -19,6 +19,22 @@ from providers import openai_compat
 from providers import pi as pi_mod
 from providers import cursor as cursor_mod
 from providers.egress_gate import check_strings, refuse_payload
+from tests import offline_home
+
+_HOME = None
+
+
+def setUpModule():
+    # Direct runs admit real home paths; keep protected_home() on a synthetic home.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 # Fixture values used as payloads. Assertions must never see these in error
@@ -153,6 +169,10 @@ class TestFailClosedDenylist(unittest.TestCase):
 
 
 class TestSeamBeforeSend(unittest.TestCase):
+    def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
+
     # Every gated consult CLI/HTTP seam. Agent/job lanes stay declared-ungated.
     _SEAMS = (
         ("grok",

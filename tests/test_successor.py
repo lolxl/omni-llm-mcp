@@ -24,6 +24,28 @@ from providers.agent_lane import (
     UnsupportedPermissionMode,
     successor_permission_argv,
 )
+from tests import offline_home
+
+# Seeds v2 records; tests/offline_home.py gives this module the real gate.
+OMNI_TEST_REAL_ADMISSION = True
+
+
+_HOME = None
+
+
+def setUpModule():
+    # Run directly, the fenced spawns below admit ~/.claude.json and the login
+    # keychain by their real names, and a CLI session rewriting them flips a
+    # test. Point protected_home() at a synthetic home for this module.
+    global _HOME
+    _HOME = offline_home.use_synthetic_home()
+
+
+def tearDownModule():
+    try:
+        _HOME.assert_module_hermetic()
+    finally:
+        _HOME.close()
 
 
 def _git_env():
@@ -123,8 +145,11 @@ class SuccessorPermissionJobsTest(unittest.TestCase):
                 os.environ[key] = value
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         os.environ["OMNI_LLM_STATE_DIR"] = _TMP
         os.environ.pop("OMNI_LLM_DEPTH", None)
+        _seed_listed("claude", "sonnet", ["low", "medium", "high"])
 
     def test_permission_mode_requires_foreman(self):
         started = jobs.start(
@@ -398,6 +423,26 @@ if not sys.stdin.isatty():
 '''
 
 
+def _seed_listed(provider, model, efforts=None):
+    from providers import catalog_v2
+    from providers.catalog_record import validate_strict
+    item = {
+        "id": model,
+        "name": model,
+        "routable_id": "%s/%s" % (provider, model),
+    }
+    if efforts is not None:
+        item["supported_efforts"] = list(efforts)
+    record, _warnings = validate_strict(provider, {
+        "provider": provider,
+        "source": "live",
+        "observed_at": "2026-11-10T00:00:00Z",
+        "availability": "provider_advertised",
+        "models": [item],
+    })
+    catalog_v2.save(provider, "default", record)
+
+
 def _read_argv_log(path):
     with open(path, encoding="utf-8") as handle:
         return [line[:-1] if line.endswith("\n") else line
@@ -408,6 +453,8 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
     """Item 4: fake PATH binaries pin argv byte-for-byte and attest."""
 
     def setUp(self):
+        _HOME.mark()
+        self.addCleanup(_HOME.assert_hermetic, self)
         os.environ["OMNI_LLM_STATE_DIR"] = _TMP
         os.environ.pop("OMNI_LLM_DEPTH", None)
         self.root = tempfile.mkdtemp(prefix="omni-successor-fake-")
@@ -502,6 +549,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
                         "session_id": "__SESSION_ID__"}),
         )) + "\n")
         os.environ["CLAUDE_CONFIG_DIR"] = self.vendor_home
+        _seed_listed("claude", "claude-sonnet-5", ["low", "medium", "high"])
         os.environ["OMNI_FAKE_PROVIDER"] = "claude"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -545,6 +593,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
                   encoding="utf-8") as handle:
             stdout_src = self._write_stdout("codex.stdout.jsonl", handle.read())
         os.environ["CODEX_HOME"] = self.vendor_home
+        _seed_listed("codex", "gpt-5.6-sol", ["low", "medium", "high"])
         os.environ["OMNI_FAKE_PROVIDER"] = "codex"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -590,6 +639,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
                 encoding="utf-8") as handle:
             stdout_src = self._write_stdout("grok.stdout.jsonl", handle.read())
         os.environ["GROK_HOME"] = self.vendor_home
+        _seed_listed("grok", "grok-4.6")
         os.environ["OMNI_FAKE_PROVIDER"] = "grok"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -654,6 +704,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
         bin_path = self._install("claude")
         stdout_src = self._claude_stream_stdout("claude-omit.stdout.jsonl")
         os.environ["CLAUDE_CONFIG_DIR"] = self.vendor_home
+        _seed_listed("claude", "claude-sonnet-5", ["low", "medium", "high"])
         os.environ["OMNI_FAKE_PROVIDER"] = "claude"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -685,6 +736,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
         bin_path = self._install("claude")
         stdout_src = self._claude_stream_stdout("claude-plan.stdout.jsonl")
         os.environ["CLAUDE_CONFIG_DIR"] = self.vendor_home
+        _seed_listed("claude", "claude-sonnet-5", ["low", "medium", "high"])
         os.environ["OMNI_FAKE_PROVIDER"] = "claude"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -717,6 +769,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
         stdout_src = self._claude_stream_stdout("claude-default.stdout.jsonl")
         env_dump = os.path.join(self.root, "env.dump")
         os.environ["CLAUDE_CONFIG_DIR"] = self.vendor_home
+        _seed_listed("claude", "claude-sonnet-5", ["low", "medium", "high"])
         os.environ["OMNI_FAKE_PROVIDER"] = "claude"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -763,6 +816,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
                 "codex-default.stdout.jsonl", handle.read())
         env_dump = os.path.join(self.root, "env.dump")
         os.environ["CODEX_HOME"] = self.vendor_home
+        _seed_listed("codex", "gpt-5.6-sol", ["low", "medium", "high"])
         os.environ["OMNI_FAKE_PROVIDER"] = "codex"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
@@ -811,6 +865,7 @@ class SuccessorFakeBinaryTest(unittest.TestCase):
                 "grok-default.stdout.jsonl", handle.read())
         env_dump = os.path.join(self.root, "env.dump")
         os.environ["GROK_HOME"] = self.vendor_home
+        _seed_listed("grok", "grok-4.6")
         os.environ["OMNI_FAKE_PROVIDER"] = "grok"
         os.environ["OMNI_FAKE_ARGV_LOG"] = self.argv_log
         os.environ["OMNI_FAKE_RECORD_SRC"] = os.path.join(
