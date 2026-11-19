@@ -5,6 +5,12 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-11-20
+
+### Fixed
+
+- `omni quota check`, `report-incident` and `policy show` now exit 74 with the one fixed stderr line `quota: cannot write the result` when stdout was closed before launch (`1>&-`), including for `--help`. Before, that case exited 1 with a traceback naming local paths. A usage error with stdout closed used to exit 1 with a traceback too; it now exits 2 with the usage text on stderr. `--help` into a broken pipe now also exits 74 on Python 3.11 and later, where it used to exit 0 because argparse swallowed the write error (refs #259).
+
 ## [0.12.0] — 2026-11-19
 
 ### Upgrade notes

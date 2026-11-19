@@ -3,16 +3,21 @@
 
 Runs against a throwaway state dir and a pinned clock (see test_quota_check).
 """
+import contextlib
+import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import unittest
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from providers import quota
 from tests.test_quota_check import EMAIL, LONG, NOW, SHORT, QuotaCase, _info
+from tests.test_quota_check import _argv as _check_argv
 
 
 def _iso(moment):
@@ -219,6 +224,200 @@ class ReportTests(IncidentCase):
         with mock.patch.object(quota, "_emit", return_value=False):
             code, _doc, _out, _err = self.report()
         self.assertEqual(code, 74)
+
+
+FIXED_LINE = "quota: cannot write the result\n"
+
+
+class ClosedStdoutTests(IncidentCase):
+    """A stdout closed before launch (``1>&-``, so ``sys.stdout`` is None) is an
+    output failure like a broken pipe: exit 74, one fixed stderr line, no trace."""
+
+    def run_closed(self, args, code=None):
+        """Run the real CLI entry with fd 1 closed before the interpreter starts."""
+        env = dict(os.environ)
+        env.update({"OMNI_LLM_STATE_DIR": self.state, "OMNI_LLM_QUOTA_PROBE": "0",
+                    "OMNI_LLM_NOTIFY_QUIET": "1"})
+        cli = [sys.executable, "-c", code] if code else [sys.executable, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "omni_cli.py")]
+        return subprocess.run(["sh", "-c", 'exec "$@" 1>&-', "sh"] + cli + list(args),
+                              env=env, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, timeout=60)
+
+    def assert_output_failure(self, proc, label):
+        self.assertEqual(proc.returncode, quota.EXIT_OUTPUT, (label, proc.stderr))
+        self.assertEqual(proc.stderr, FIXED_LINE, label)
+        self.assert_no_trace(proc, label)
+
+    def assert_no_trace(self, proc, label):
+        self.assertNotIn("Traceback", proc.stderr, label)
+        self.assertNotIn("/", proc.stderr, label)
+
+    def test_the_harness_really_closes_fd_1(self):
+        proc = self.run_closed([], code="import sys; sys.exit(0 if sys.stdout is None else 3)")
+        self.assertEqual((proc.returncode, proc.stderr), (0, ""))
+
+    def test_check_with_a_closed_stdout_exits_74(self):
+        proc = self.run_closed(["quota"] + _check_argv(login="xai"))
+        self.assert_output_failure(proc, "check")
+
+    def test_report_incident_with_a_closed_stdout_exits_74_and_records(self):
+        until = _iso(datetime.now(timezone.utc) + timedelta(seconds=600))
+        proc = self.run_closed(["quota"] + _report_argv(until=until))
+        self.assert_output_failure(proc, "report-incident")
+        with open(self.marker_path(), encoding="utf-8") as handle:
+            marker = json.load(handle)
+        self.assertEqual((marker["quota_pool"], marker["until"]), ("xai-sub", until))
+
+    def test_policy_show_with_a_closed_stdout_exits_74(self):
+        proc = self.run_closed(["quota", "policy", "show", "--json"])
+        self.assert_output_failure(proc, "policy show")
+
+    def test_help_with_a_closed_stdout_exits_74(self):
+        for args in (["check", "--help"], ["--help"], ["policy", "show", "--help"]):
+            proc = self.run_closed(["quota"] + args)
+            self.assert_output_failure(proc, " ".join(args))
+
+    def test_a_usage_error_with_a_closed_stdout_stays_exit_2(self):
+        # argparse prints the usage text on stderr only, so nothing needed stdout.
+        proc = self.run_closed(["quota", "check", "--json"])
+        self.assertEqual(proc.returncode, quota.EXIT_USAGE, proc.stderr)
+        self.assertIn("usage error", proc.stderr)
+        self.assert_no_trace(proc, "usage")
+
+    def test_a_missing_stdout_is_an_output_failure_in_process(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdout", None), contextlib.redirect_stderr(err):
+            codes = [quota.main(["policy", "show", "--json"]),
+                     quota.main(["check", "--help"]),
+                     quota.main(["check", "--json"])]
+            restored = sys.stdout
+        self.assertEqual(codes, [quota.EXIT_OUTPUT, quota.EXIT_OUTPUT, quota.EXIT_USAGE])
+        self.assertIsNone(restored)
+        self.assertEqual(err.getvalue().count(FIXED_LINE), 2)
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_a_stream_error_from_stdout_is_an_output_failure(self):
+        for exc in (OSError(32, "pipe"), ValueError("closed file")):
+            class Boom(object):
+                def write(self, _text, _exc=exc):
+                    raise _exc
+
+                def flush(self, _exc=exc):
+                    raise _exc
+
+            for args in (["policy", "show", "--json"], ["check", "--help"]):
+                err = io.StringIO()
+                with mock.patch.object(sys, "stdout", Boom()), contextlib.redirect_stderr(err):
+                    code = quota.main(args)
+                self.assertEqual((code, err.getvalue()), (quota.EXIT_OUTPUT, FIXED_LINE),
+                                 (exc, args))
+
+    def test_a_stream_error_from_the_flush_after_help_is_an_output_failure(self):
+        class FlushBoom(io.StringIO):
+            def flush(self):
+                raise OSError(32, "pipe")
+
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdout", FlushBoom()), contextlib.redirect_stderr(err):
+            code = quota.main(["check", "--help"])
+        self.assertEqual((code, err.getvalue()), (quota.EXIT_OUTPUT, FIXED_LINE))
+
+    def test_a_parser_bug_is_not_an_output_failure(self):
+        err = io.StringIO()
+        with mock.patch.object(quota, "build_parser", side_effect=RuntimeError("bug")), \
+                mock.patch.object(sys, "stdout", io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(RuntimeError):
+                quota.main(["policy", "show", "--json"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_flush_bug_after_help_is_not_an_output_failure(self):
+        class FlushBug(io.StringIO):
+            def flush(self):
+                raise RuntimeError("bug")
+
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdout", FlushBug()), contextlib.redirect_stderr(err):
+            with self.assertRaises(RuntimeError):
+                quota.main(["check", "--help"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_parser_stream_error_with_a_healthy_stdout_is_not_an_output_failure(self):
+        for exc in (OSError(5, "parser bug"), ValueError("parser bug")):
+            err = io.StringIO()
+            out = io.StringIO()
+            with mock.patch.object(quota, "build_parser", side_effect=exc), \
+                    mock.patch.object(sys, "stdout", out), \
+                    contextlib.redirect_stderr(err):
+                with self.assertRaises(type(exc)):
+                    quota.main(["policy", "show", "--json"])
+                self.assertIs(sys.stdout, out)
+            self.assertEqual(err.getvalue(), "")
+
+    def test_stdout_is_restored_after_the_parse(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            quota.main(["policy", "show", "--json"])
+            self.assertIs(sys.stdout, out)
+            self.assertEqual(quota.main(["check", "--help"]), 0)
+            self.assertIs(sys.stdout, out)
+
+    def test_the_recording_stdout_records_each_kind_of_failure(self):
+        class Bad(io.StringIO):
+            def write(self, _text):
+                raise OSError(32, "pipe")
+
+        class BadFlush(io.StringIO):
+            def flush(self):
+                raise ValueError("closed file")
+
+        proxy = quota._RecordingStdout(None)
+        with self.assertRaises(OSError):
+            proxy.write("x")
+        self.assertTrue(proxy.failed)
+        proxy = quota._RecordingStdout(None)
+        with self.assertRaises(OSError):
+            proxy.flush()
+        self.assertTrue(proxy.failed)
+        proxy = quota._RecordingStdout(Bad())
+        with self.assertRaises(OSError):
+            proxy.write("x")
+        self.assertTrue(proxy.failed)
+        proxy = quota._RecordingStdout(BadFlush())
+        proxy.write("x")
+        self.assertFalse(proxy.failed)
+        with self.assertRaises(ValueError):
+            proxy.flush()
+        self.assertTrue(proxy.failed)
+        proxy = quota._RecordingStdout(io.StringIO())
+        proxy.write("x")
+        proxy.flush()
+        self.assertFalse(proxy.failed)
+
+    def test_a_document_that_cannot_be_serialized_is_not_an_output_failure(self):
+        loop = {}
+        loop["self"] = loop  # json.dumps raises ValueError, which must not read as a stream error
+        err = io.StringIO()
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out), contextlib.redirect_stderr(err):
+            with self.assertRaises(ValueError):
+                quota._emit(loop)
+        self.assertEqual((err.getvalue(), out.getvalue()), ("", ""))
+
+    def test_output_failed_does_not_raise_without_streams(self):
+        with mock.patch.object(sys, "stdout", None), mock.patch.object(sys, "stderr", None):
+            quota._output_failed()
+
+    def test_output_failed_opens_no_descriptor_without_a_stdout(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdout", None), \
+                mock.patch.object(quota.os, "open") as opened, \
+                contextlib.redirect_stderr(err):
+            quota._output_failed()
+        opened.assert_not_called()
+        self.assertEqual(err.getvalue(), FIXED_LINE)
 
 
 class CheckTests(IncidentCase):

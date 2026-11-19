@@ -1096,6 +1096,8 @@ def _output_failed():
         sys.stderr.flush()
     except Exception:
         pass
+    if sys.stdout is None:
+        return  # no descriptor to park: do not even open the null device
     try:
         null = os.open(os.devnull, os.O_WRONLY)
         try:
@@ -1106,11 +1108,47 @@ def _output_failed():
         pass
 
 
+class _RecordingStdout(object):
+    """Wraps the real stdout (which may be None: closed before launch) while
+    argparse parses and records whether a write or flush on it ever failed.
+    argparse swallows some write errors itself, so ``failed`` is the only
+    reliable account of whether the result could be written."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.failed = False
+
+    def _call(self, name, *args):
+        if self._inner is None:
+            self.failed = True
+            raise OSError(9, "no stdout")
+        try:
+            return getattr(self._inner, name)(*args)
+        except (OSError, ValueError):
+            self.failed = True
+            raise
+
+    def write(self, text):
+        return self._call("write", text)
+
+    def flush(self):
+        return self._call("flush")
+
+    def __getattr__(self, name):
+        if self._inner is None:
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
 def _emit(doc):
     """Write one JSON line to stdout. False (after a fixed stderr message) when
-    stdout is closed or fails: no traceback, no path."""
+    stdout is missing, closed or fails: no traceback, no path. A document that
+    cannot be serialized is a bug, not an output failure, and raises."""
+    text = json.dumps(doc, separators=(",", ":"), ensure_ascii=True) + "\n"
     try:
-        sys.stdout.write(json.dumps(doc, separators=(",", ":"), ensure_ascii=True) + "\n")
+        if sys.stdout is None:
+            raise OSError(9, "no stdout")
+        sys.stdout.write(text)
         sys.stdout.flush()
     except (OSError, ValueError):
         _output_failed()
@@ -1160,21 +1198,37 @@ def run(args):
 
 def main(argv=None):
     """Entry for ``omni quota ...``: parse *argv* (without ``quota``) and run it."""
+    # argparse writes ``--help`` to stdout and, on Python 3.11+, swallows a write
+    # error itself. Record every write and flush on stdout during the parse and
+    # decide from that record, not from the exception type.
+    real = sys.stdout
+    proxy = _RecordingStdout(real)
+    sys.stdout = proxy
+    done = False
+    code = EXIT_OUTPUT
     try:
-        args = build_parser().parse_args(argv)
-    except OSError:
-        # Unbuffered stdout (``python3 -u``): argparse's own help or usage write
-        # raises here instead of at the flush below.
-        _output_failed()
-        return EXIT_OUTPUT
-    except SystemExit as exc:
-        # ``--help`` and usage errors write through argparse and leave the text
-        # buffered: flush it here so a closed stdout is reported, not raised at
-        # interpreter exit.
         try:
-            sys.stdout.flush()
-        except (OSError, ValueError):
+            args = build_parser().parse_args(argv)
+        except SystemExit as exc:
+            done = True
+            code = exc.code if isinstance(exc.code, int) else EXIT_USAGE
+            if real is not None:
+                # The help text may still sit in the buffer: flush it here so a
+                # broken pipe is reported, not raised at interpreter exit. With no
+                # stdout nothing was written (a write would have been recorded).
+                try:
+                    proxy.flush()
+                except (OSError, ValueError):
+                    pass  # recorded on the proxy
+        except Exception:
+            if not proxy.failed:
+                raise
+            done = True
+    finally:
+        sys.stdout = real
+    if done:
+        if proxy.failed:
             _output_failed()
             return EXIT_OUTPUT
-        return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+        return code
     return run(args)
