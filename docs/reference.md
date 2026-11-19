@@ -12,7 +12,7 @@ A zero-dependency **MCP stdio server** that wraps the Google **Antigravity CLI (
 
 ## Account profile listing and checks
 
-`omni profiles` lists the account profiles on each road (claude / codex / grok / cursor), including identity and status. `--json` / `--road` / `--name` attach only to the `list` / `check` / `add` subcommands (attaching them to the `profiles` parent command is overwritten by subparser defaults). A tty prints a table; `--json` or a non-tty prints JSON. When cursor has no key/config set, the default state is `unconfigured` (a named status; it does not enter problems). `omni profiles check [--live] [--road R] [--name N] [--strict-quota]` checks shape, identity, quota (codex only), and an optional live session, in that order. If any cell has a problem, the process exits non-zero. Codex cooldown (quota reached / used≥95) is shown only under COOLDOWN and does not fail `check`; `--live` still runs. Failure to read quota is always a problem. Only `--strict-quota` treats cooldown as failure (exit 2). `omni profiles add <road> <name> [--exec] [--persist]` creates `~/.<road>-<name>` (mode 0700; an existing empty directory of the same name is reused, and is not treated as already exists; cursor supports only `CURSOR_API_KEY_<NAME>` and does not create a directory), and prints the vendor login command (`CLAUDE_CONFIG_DIR=<dir> claude auth login` / `CODEX_HOME=<dir> codex login` / `GROK_HOME=<dir> grok login`). `--exec` runs that command in the foreground only on a tty, then runs a `--live` check. Without a tty it LOUD-rejects. A non-zero login exit code is reported as `login_failed` (detail includes rc and the directory). If the directory is still empty it is deleted so the attempt can be retried; otherwise it is left in place and the detail explains why. `--persist` appends `export <VAR>=<dir>` to `~/.config/omni-llm/profiles.env` (directory 0700, file 0600, deduplicated by variable name) and prints a JSON snippet that can be pasted into the MCP server `env`. It never modifies any harness config file. For cursor, `--persist` is a LOUD `unsupported_persist` (the snippet is still printed). A non-empty name that already exists in env or discovery is rejected. Scanning `~/.claude-<name>` / `~/.codex-<name>` / `~/.grok-<name>` is opt-in: it turns on only when `OMNI_LLM_PROFILE_DISCOVERY=1`. On failure it turns off (symlinks, the same realpath as another profile or the default root, a uid that is not this process, or group/other writability are all rejected). This set of commands is not an MCP tool.
+`omni profiles` lists the account profiles on each road (claude / codex / grok / cursor, plus one agy row for the Google login), including identity and status. `--json` / `--road` / `--name` attach only to the `list` / `check` / `add` subcommands (attaching them to the `profiles` parent command is overwritten by subparser defaults). A tty prints a table; `--json` or a non-tty prints JSON. When cursor has no key/config set, the default state is `unconfigured` (a named status; it does not enter problems). `omni profiles check [--live] [--road R] [--name N] [--strict-quota]` checks shape, identity, quota (codex only), and an optional live session, in that order. If any cell has a problem, the process exits non-zero. Codex cooldown (quota reached / used≥95) is shown only under COOLDOWN and does not fail `check`; `--live` still runs. Failure to read quota is always a problem. Only `--strict-quota` treats cooldown as failure (exit 2). `omni profiles add <road> <name> [--exec] [--persist]` creates `~/.<road>-<name>` (mode 0700; an existing empty directory of the same name is reused, and is not treated as already exists; cursor supports only `CURSOR_API_KEY_<NAME>` and does not create a directory), and prints the vendor login command (`CLAUDE_CONFIG_DIR=<dir> claude auth login` / `CODEX_HOME=<dir> codex login` / `GROK_HOME=<dir> grok login`). `--exec` runs that command in the foreground only on a tty, then runs a `--live` check. Without a tty it LOUD-rejects. A non-zero login exit code is reported as `login_failed` (detail includes rc and the directory). If the directory is still empty it is deleted so the attempt can be retried; otherwise it is left in place and the detail explains why. `--persist` appends `export <VAR>=<dir>` to `~/.config/omni-llm/profiles.env` (directory 0700, file 0600, deduplicated by variable name) and prints a JSON snippet that can be pasted into the MCP server `env`. It never modifies any harness config file. For cursor, `--persist` is a LOUD `unsupported_persist` (the snippet is still printed). A non-empty name that already exists in env or discovery is rejected. Scanning `~/.claude-<name>` / `~/.codex-<name>` / `~/.grok-<name>` is opt-in: it turns on only when `OMNI_LLM_PROFILE_DISCOVERY=1`. On failure it turns off (symlinks, the same realpath as another profile or the default root, a uid that is not this process, or group/other writability are all rejected). This set of commands is not an MCP tool.
 
 Scheduled probe: `omni profiles schedule --print` prints a launchd plist (label `com.omni-llm.profiles-probe`, which by default runs `omni health --probe --all-profiles --json --quiet` every 15 minutes, with stdout written to `~/.local/state/omni-llm/logs/profiles-probe.log`). `--install` is what writes it into `~/Library/LaunchAgents` and runs `launchctl bootstrap`; it is not installed by default. `--uninstall` unloads and deletes the file; if it is not installed, the result is LOUD. On failure the result is LOUD, and detail carries the launchctl rc. `--print` does not write a file and does not call launchctl.
 
@@ -86,12 +86,13 @@ Install: `pipx install git+https://github.com/lolxl/omni-llm-mcp` (see the READM
 | `omni img` | `llm_image` | `omni img "edit" --source-image a.png` |
 | `omni models` | `list_models` | `omni models` |
 | `omni health` | — | `omni health` / `omni health --probe` / `omni health --probe --all-profiles --json` / `omni health flag grok-4.5 --profile premium` / `omni health lease acquire --token T --pool P --order O --ttl N` / `omni health lease renew --token T` / `omni health lease release --token T` |
-| `omni profiles` | — (CLI-only, not in MCP) | `omni profiles list` / `check [--live] [--strict-quota]` / `add <claude|codex|grok|cursor> <label> [--exec] [--persist]` / `schedule --print`; Grok quota is shown as unknown |
+| `omni profiles` | — (CLI-only, not in MCP) | `omni profiles list` / `check [--live] [--strict-quota]` / `add <claude|codex|grok|cursor> <label> [--exec] [--persist]` / `schedule --print`; Grok quota is shown as unknown; agy is one `default` row with `quota_unmonitored` (no `add`, no live probe) |
 | `omni agent` | — (CLI-only, not in MCP) | `omni agent "task" --workdir <worktree> --effort xhigh` |
 | `omni agent start` | — (CLI-only, not in MCP) | `omni agent start "task" --workdir <worktree>` |
 | `omni artifact` | — (read / rm / gc spilled bodies) | `omni artifact read <id>` |
 | `omni contract` | — (CLI-only, not in MCP) | `omni --version` / `omni contract` (see the next section) |
 | `omni mcp` | all four MCP tools (it IS the MCP server) | `claude mcp add --scope user omni-llm -- omni mcp`; runs `providers/mcp_server.py` over stdio, prints only JSON-RPC on stdout (no CLI envelope), exits on stdin EOF; logs `entry: "mcp"` in metrics |
+| `omni quota` | — (CLI-only, not in MCP; called by external dispatch scripts) | `omni quota check --login openai --transport codex:gpt-6.2-sol --model gpt-6.2-sol --task-class long --context primary --json` / `omni quota policy show --json` (see "Quota decision") |
 | `omni dispatch-exec` | — (CLI-only, not in MCP; called by external dispatch scripts) | `omni dispatch-exec --provider grok --model M --effort E --workdir W --prompt-file P --outfile O …` (required flags are in that section) |
 
 `omni health` lists, as JSON, the seats that are still cooling down. When a valid lease exists, the `--json` payload also includes `leases`. `omni health lease acquire --token T --pool P --order O --ttl N` writes a lease; `renew` / `release` renew and release it. `omni health flag <model>`
@@ -103,7 +104,7 @@ Unix or ISO-8601 timestamp. `omni health --probe` runs one
 that window's `source=quota` records; if it is still exhausted, it writes `until` as the vendor's `resetsAt`. The same `--probe` also runs one job
 `sweep_orphans`, and the payload includes `jobs_repaired` (the ids that were repaired); `--quiet`
 also includes the `repaired` count. `omni health --probe --all-profiles`
-refreshes the ledger for every known profile on every road (claude / codex / grok / cursor): codex runs a real quota RPC for each profile; claude / cursor send no request and only run the existing
+refreshes the ledger for every known profile on every road (claude / codex / grok / cursor / agy): codex runs a real quota RPC for each profile; claude / cursor / agy send no request and only run the existing
 maintain/prune so expired flags disappear. The emitted `quota` is grouped as `{road: {name: ...}}`
 (names and quota only, no identity); seats that are still cooling down still exit 0 (advisory).
 `--all-profiles` without `--probe` is an argparse error. Health status is also attached to the return value of `list_models()`.
@@ -139,9 +140,8 @@ it is not mis-flagged because of `login` / `429` in truncated output); `crash_st
    at the start of dispatch) deletes the entry and records one `seat_recovered source=expired`.
    `active` / `snapshot` judge only by `until` and do not write the file.
 
-Reads and read-modify-writes of the ledger and `quota.json` go through `<state_dir>/health.lock` (wait at most 2s;
-if the lock cannot be taken, this mutation is skipped and dispatch itself continues). During an RPC it also holds
-`quota.lock`, and it does not hold the ledger lock across the RPC. Set `OMNI_LLM_QUOTA_PROBE=0` to turn off RPC probing entirely (CI, offline hosts; unit-test fixtures are set this way too). Set `OMNI_LLM_NOTIFY_QUIET=1` to keep the event lines on stderr and skip the external `OMNI_LLM_NOTIFY_CMD`; agent child processes inside the fence and the test suite set it automatically; only the strict `"1"` is recognized. The old session-file probe is enabled only when `OMNI_LLM_CODEX_SESSIONS_DIR` is set; it is a compatibility path and is no longer recommended.
+Reads and read-modify-writes of the ledger go through `<state_dir>/health.lock` (wait at most 2s;
+if the lock cannot be taken, this mutation is skipped and dispatch itself continues). The Codex quota cache never takes that lock: each profile's row lives in its own file, `<state_dir>/quota/<sha256 of the profile label>.json` (the directory is created with mode 0700; the file holds the row plus `"profile": <label>`), and a write replaces only that profile's file, atomically. During an RPC the probe holds `quota.lock` around the cache drop, the call and the cache write, and it does not hold the ledger lock across the RPC. A `quota` that is a symbolic link or not a directory, and a profile file that is a symbolic link or not a regular file, are refused: nothing is written through them and one fixed line is logged. A malformed file of the profile being refreshed is logged once and replaced. The cache older than this layout (`<state_dir>/quota.json`, one row per profile) is not migrated: rows live 60 seconds, so every profile simply probes again after the upgrade. The old file is never read; the first successful write of any profile's file deletes it (best effort, by name relative to the state directory, never following a link; a failure is logged once and ignored). A profile file is read with a bound of 64 KiB; a larger file is malformed. A forced refresh first drops the profile's file, and if that drop fails for any reason (the unlink is refused, the directory is unsafe, the directory cannot be synced) the RPC does not run and the refresh returns `quota_cache_drop_failed`, so the old observation cannot outlive a forced refresh; a file that is already absent is a successful drop. A write is durable only after the directory is synced: a failed directory sync fails the write (one fixed line is logged), and a failed sync after an unlink fails the drop. A drop never needs to read the file: a malformed, oversized or unreadable regular file is logged once and unlinked anyway. Every operation opens `quota/` once, checks the descriptor (a real directory owned by the current user) and does its reads, temp files, renames and unlinks through it, so a swap of the directory name for a link afterwards changes nothing. Set `OMNI_LLM_QUOTA_PROBE=0` to turn off RPC probing entirely (CI, offline hosts; unit-test fixtures are set this way too). Set `OMNI_LLM_NOTIFY_QUIET=1` to keep the event lines on stderr and skip the external `OMNI_LLM_NOTIFY_CMD`; agent child processes inside the fence and the test suite set it automatically; only the strict `"1"` is recognized. The old session-file probe is enabled only when `OMNI_LLM_CODEX_SESSIONS_DIR` is set; it is a compatibility path and is no longer recommended.
 
 **Request metrics** (issue #22 P1): each consult call (`llm_generate` /
 `llm_big_context` / `llm_image`, and CLI `omni gen` / `big` / `img`) appends one
@@ -333,7 +333,7 @@ A handoff successor uses the same `omni agent start`: `--model` / `--effort` / `
 
 Downstream tools (external plugins and dispatch scripts) do not import omni modules and do not assume a checkout path. They ask the installed `omni` directly:
 
-- `omni --version` prints `omni <version>` (for example `omni 0.11.0`) and exits with 0. The version string has a single source, `providers/version.py`. The MCP server's `serverInfo.version` is taken from it as well.
+- `omni --version` prints `omni <version>` (for example `omni 0.12.0`) and exits with 0. The version string has a single source, `providers/version.py`. The MCP server's `serverInfo.version` is taken from it as well.
 - `omni contract` prints exactly one JSON object on stdout and exits with 0. It is pure introspection: it does not connect to the network, does not start any vendor binary, and does not create or write the state directory. Keys: `name`, `version`, `contract_version`, `cli.subcommands` (derived from `build_parser()` and sorted), `mcp.server_name` and `mcp.tools` (derived from `TOOLS` in `providers/dispatch.py` and sorted), `dispatch_exec.result_record_version` / `providers` / `exit_codes` (rc string → short meaning), and `state_dir` (the state directory that is actually in effect, honoring `OMNI_LLM_STATE_DIR`; it reports the path only and does not create it).
 - `contract_version` is incremented only when any item listed in the contract has a **breaking change** (removing or renaming a subcommand or MCP tool, changing the meaning of an exit code, changing the result-record `version`, or removing or changing the type of a key). Adding a subcommand, tool, or key does not increment it.
 - How downstream checks: first see whether `version` meets the required minimum, then use `omni contract` to confirm that the required subcommands (`cli.subcommands`) and tools (`mcp.tools`) are present, rather than inferring that from the version number.
@@ -372,6 +372,126 @@ Job-lane backends: grok uses `--output-format streaming-messages-json --include-
 Single-word tasks named exactly `start/status/result/tail/stop/jobs/resume` must be invoked through the synchronous lane; different phrasing or quoting cannot help — they are reserved verbs.
 
 `<job>` may be a full job directory or a job id alone. The supervisor uses `job.lock` as the liveness signal, and `result.json` is written before the terminal state; a stop result uses a separate `reason: "stopped"`. This batch deliberately **does not do job GC**. `omni agent jobs` first runs one lazy `sweep_orphans`: a job whose state is non-terminal, whose supervisor `job.lock` has been released, and that is past the startup grace is repaired to the terminal state recorded in `result.json` if that file has been written (done or failed), otherwise repaired to failed (detail `supervisor lock is free`), and a backend whose identity matches is reaped; the output is `{jobs, repaired}` (`repaired` is the repaired ids). Unreadable job directories are skipped and recorded as `job_sweep_skipped`. `omni health --probe` (including the scheduled probe every 15 minutes) also runs the same sweep once. `omni agent status <id>` still repairs a single job. A job whose lock is still held, or whose startup grace has not elapsed, is left untouched.
+
+## Quota decision (`omni quota`)
+
+`omni quota check` answers one question for one billed login and account: can this money still be spent? It is a decision layer over what the tool already keeps (the seat-health ledger, the Codex `account/rateLimits/read` probe, the account profiles) plus a usage snapshot the caller supplies for Anthropic. It decides quota only. Seat validity, capacity leases (how many runs may start now), fallback order and overrides stay with the caller. The docs always say "quota pool" or "capacity pool" in full, never a bare "pool".
+
+```
+omni quota check --login L [--account A] --transport T --model M \
+    --task-class long|short --context primary|fallback \
+    [--anthropic-snapshot PATH] --json
+omni quota policy show --json
+omni quota report-incident --login L [--account A] --kind hard_rate_limit \
+    --until ISO8601 --json
+```
+
+- An omitted `--account` means `default`.
+- `--login` and `--account` must match `[A-Za-z0-9_-]+` (at most 64 characters). A value that does not is a usage error with a fixed message that never echoes it. `--transport` and `--model` take `[A-Za-z0-9_.:/+-]{1,128}`. The transport is validated and reserved: the decision is about the billed (login, account), not the transport. No argument value is ever printed back.
+- JSON goes to stdout on exit 0 and exit 10. A usage error prints one fixed line on stderr and nothing on stdout. If stdout itself cannot be written, exit 74 with one fixed stderr line (see "Output failure"); this includes `--help` and any other argparse output.
+- `policy show` prints the effective login/account to quota-pool map and the `policy_revision`. It exits 10 with `reasons: ["registry_invalid"]` if the shipped policy is invalid.
+
+### Policy
+
+`providers/quota_policy.json` ships as package data. It is schema-validated when loaded, and `policy_revision` is the sha256 (hex) of its canonical JSON (sorted keys, no whitespace). There is no state-dir or environment overlay: the shipped file is the only authority.
+
+| Login | Quota pool | Road | Monitoring | Accounts |
+|---|---|---|---|---|
+| `openai` | `openai-sub` | codex | `codex_rpc` | `default` |
+| `anthropic` | `anthropic-sub` | claude | `anthropic_snapshot` | `default` |
+| `xai` | `xai-sub` | grok | `unmonitored` | `default` |
+| `google` | `google-sub` | agy | `unmonitored` | `default` |
+| `cursor` | `cursor-sub` | cursor | `unmonitored` | `default` |
+
+Each quota pool maps to the tool profile `default` for its road. One threshold applies to every monitored quota pool: `reserve_threshold_bp` 9000 (a window at or above 90.00% is refused). A monitored quota pool serves exactly one account; another account needs its own policy row and telemetry binding. A check for an account the policy does not list for that login refuses as `unknown_account` and never reads or borrows another account's telemetry.
+
+### Telemetry
+
+- `codex_rpc`: only the requested profile's cache file (`<state_dir>/quota/<sha256 of the profile label>.json`) is read, once, by the strict reader; another profile's file is never opened, so a malformed file refuses only its own profile. A row of that file bound to the profile's home (its `home_id`) and observed at most 60 s ago, or at most 5 s in the future (the Codex future tolerance, `future_tolerance_seconds` in the policy), is judged exactly as that read returned it; it is never read a second time, so a file replaced after the read changes nothing. A missing, stale, future-dated or other-home row, or a disabled probe (`OMNI_LLM_QUOTA_PROBE=0`), goes to one `account/rateLimits/read` call with a 5 s budget (inside the caller's 10 s gate), which bypasses the cache (`force`) and returns the reply to be judged. Both windows, the vendor `reached` flag, `quota_unknown`, the types of `reached`, `primary_reached`, `resets_at`, `window_mins` and `plan`, and finite percentages are checked; any malformed window refuses the whole observation. A reply with a secondary window and no valid primary percentage (missing, or dropped as malformed by the reply parser) is `malformed_telemetry`: a healthy secondary never vouches for it. The higher window decides, with decimal half-up conversion to basis points. An error, timeout, disabled probe or missing codex CLI is `telemetry_unavailable`. Errors are never cached. The deprecated session-file walk is not used. The scheduled probe (`omni profiles schedule`) is optional: it only keeps the cache warm.
+- `anthropic_snapshot`: reads the normalized snapshot at `--anthropic-snapshot PATH` (the path is an input, not a policy value). No path, or no file, is `missing_telemetry`. The snapshot is a JSON object with `generated_at` (ISO 8601, `Z` or offset), a non-empty `windows` list of `{"kind": string, "used_percent": number 0..100}` and an optional `account`. Input caps: at most 1 MiB (1,048,576 bytes) and at most 16 windows; a larger file or list is `malformed_telemetry`, as is a duplicate key anywhere, NaN, Infinity or a number that overflows to infinity (`1e999`) anywhere (including in a field nobody uses), or a root that is not an object. It is stale when older than 7200 s or more than 300 s in the future. The highest window decides, converted to basis points with decimal half-up rounding. Account binding: a snapshot that names an account must name the requested one (a string equal to it, otherwise `malformed_telemetry`, whatever path or symlink delivered it); a snapshot with no `account` field is accepted only for `default`, the single-account binding. `kind` is echoed only when it matches `[A-Za-z0-9_.-]{1,32}`, otherwise `other`.
+- `unmonitored`: eligible with reason `unmonitored_pool` for context `primary`; ineligible for context `fallback`. Both for any task class.
+
+### Fail closed
+
+- The ledger (`health.json`) and the requested profile's quota cache file (`quota/<sha256 of the label>.json`) are read by new strict readers. A truly absent file is an empty ledger or an absent cache row (first run); anything else that is not exactly readable refuses: malformed JSON, a duplicate key, NaN, Infinity or a number that overflows to infinity (`1e999`; one decoder serves the policy, snapshot, ledger and cache reads), a root or row that is not an object, a symbolic link (dangling or not; the file is opened without following links and must be a regular file), a present `until` (null included) that is not a finite timestamp, a present `credit_hold` (null included) that is not a hold with a finite `until`, a flag row (`source`, `flagged_at` or `probe_after`) without one, a cache file whose row has no finite-number `checked_at`, has a mistyped `used_percent`, `resets_at`, `window_mins`, `reached`, `primary_reached`, `home_id` or `secondary`, or names another profile label than the one requested, a `quota` directory that is a symbolic link or not a directory, an unreadable file. A streak-only row (a crash counter with no `until` and no flag marker) stays valid. Ledger failures are `ledger_unreadable`; quota-cache failures are `telemetry_malformed` and are checked before any RPC. They concern only the requested profile: a malformed file of another profile changes no decision. To recover, repair or delete the profile's file. The lenient readers that routing, lease and probe code use are unchanged.
+- Missing monitored telemetry is never healthy.
+- An active ledger flag refuses as `ledger_cooling` when it belongs to the billed road of the quota pool: its account key (`<road>@default`), a window of it (`<road>#week@default`, `<road>#m<minutes>@default`) or the requested model's own key. A model that names another road (`codex/...` for a claude quota pool) matches nothing of that road, so another road's account or window flag never cools this quota pool; likewise a bare model name that belongs to another road (`grok-4.6` on an anthropic check) contributes no key. Ledger keys and the model are compared in `pool_key` form, so a `CURSOR/auto` flag cools `cursor:auto@default`. Manual and crash holds cool like any other flag and are never softened. The health ledger's own 95% flag still drives live account selection; this interface applies the single 9000 bp threshold and reports an existing flag under its own reason.
+- Any unexpected failure while deciding refuses (`registry_invalid`); it never produces an eligible decision.
+
+### Incidents (`report-incident`, `quota-incident/v1`)
+
+`omni quota report-incident` records that one quota pool and account hit a hard rate limit until a given time. `check` then refuses that quota pool and account with `hard_rate_limit` until the incident expires.
+
+- `--login` and `--account` are validated as for `check` and never echoed; an omitted account is `default`. A login with no quota pool, or an account the policy does not list for it, is a usage error (exit 2). `--kind` accepts only `hard_rate_limit`. `--until` must be an ISO 8601 instant that names its timezone (`Z` or an offset); it is stored in UTC to the second.
+- Marker: one file per quota pool, account and kind, `<state dir>/quota-incidents/<quota pool>.<account>.<kind>.json`, holding `interface_version`, `quota_pool`, `account`, `kind`, `until`, `recorded_at` and `incident_id` (uuid4), in that order. The directory is created with mode 0700 and the file with 0600. It is written atomically (a temp file in the same directory, fsync, replace), so the last report wins. Each report also appends the same fields as one line to `<state dir>/quota-incidents.jsonl`, with the audit's mode and rotation.
+- Output: one JSON object, `interface_version`, `ok: true`, `quota_pool`, `login`, `account`, `kind`, `until`, `recorded_at`, `incident_id`. It never carries a path. Exit 0 when recorded, 2 on a usage error, 73 when the marker cannot be written (one fixed stderr line, `quota: cannot record the incident`, no path, no traceback; nothing is logged) and 74 when stdout cannot be written.
+- In `check`, the marker is read right after the login and account are resolved, before the ledger, any telemetry and the `unmonitored` rule, so it applies to monitored and unmonitored quota pools alike. No marker file: no incident. `until` after now: `ineligible`, reason `hard_rate_limit`, exit 10, for long and short tasks; `expires_at` is the earlier of `until` and the 300 s cap. `until` at or before now: ignored.
+- Fail closed: a marker that is present but not exactly readable refuses with `hard_rate_limit`, as the caller does with a corrupt marker. That covers a symbolic link (the file is opened without following links), a file that is not regular, more than 64 KiB, malformed JSON (the strict decoder), a root that is not an object, missing or extra fields, a marker for another quota pool, account, kind or interface, a `recorded_at` or `until` that is not an instant with a timezone, and an `incident_id` that is not a uuid. Such a decision expires at `checked_at`.
+- The decision's audit line then carries one extra field, `incident_state`: `active`, `expired` or `unreadable` (absent when there is no marker). It is never printed.
+- Recovery: report the same login and account again with a past `--until` (the documented way to clear an incident, as in the caller), or delete the marker file. A corrupt marker file or a symbolic link is cleared the same way. A directory at the marker path, or a file where the `quota-incidents` directory belongs, cannot be replaced (`report-incident` exits 73) and must be deleted by hand.
+- The tool never reads the caller's own state directory. Existing caller markers are reconciled by the caller, which reports each active one through `report-incident`.
+
+### Decisions and exit codes
+
+| decision | exit | when |
+|---|---|---|
+| `eligible` | 0 | no refusing reason; reasons `["ok"]` or `["unmonitored_pool"]` |
+| `advisory` | 0 | `--task-class short` and the only refusing reason is `quota_reserve` on a valid, correctly bound observation |
+| `ineligible` | 10 | any other refusing reason, for `long` and `short` alike: missing, unreadable, malformed, stale, future-dated beyond tolerance, wrongly bound or failed evidence, an active or unreadable incident marker, a cooling ledger flag, a strict-read or config reason, or `unmonitored_pool` as a fallback |
+| (usage error) | 2 | invalid or missing argument; no decision, no audit line |
+| (output failure) | 74 | stdout could not be written; the decision was audited but not delivered |
+
+Invalid or unverifiable evidence always refuses. Only a valid, correctly bound observation whose usage is at or over the threshold (`quota_reserve`) turns into `advisory` for a short task. Never softened, for any task class: `stale_telemetry`, `missing_telemetry`, `malformed_telemetry`, `telemetry_unavailable`, `telemetry_malformed`, `ledger_cooling`, `ledger_unreadable`, `hard_rate_limit`, `unknown_account`, `unknown_login`, `registry_invalid`, `unmonitored_pool` (fallback).
+
+### Reasons (closed enum)
+
+| reason | meaning | caller equivalent |
+|---|---|---|
+| `ok` | monitored, below the threshold | `ok` |
+| `unmonitored_pool` | no telemetry for this quota pool (eligible as primary, refused as fallback) | `unmonitored_pool` |
+| `quota_reserve` | a window at or above `reserve_threshold_bp`, or the vendor reports the limit reached | `quota_reserve` |
+| `stale_telemetry` | observation older than its freshness limit, or too far in the future (never softened) | `stale_telemetry` (advisory for a short task in the caller) |
+| `missing_telemetry` | no snapshot, or no window in the Codex reply (never softened) | `missing_telemetry` (advisory for a short task in the caller) |
+| `malformed_telemetry` | the snapshot or the Codex reply is not valid (schema, range, types, duplicate key, `quota_unknown`, no observation time, a snapshot bound to another account, a secondary window without a valid primary; never softened) | `malformed_telemetry` (advisory for a short task in the caller) |
+| `unknown_login` | the login has no quota pool in the policy | `unknown_login` |
+| `registry_invalid` | the shipped policy is unreadable or invalid, or the check itself failed | `registry_invalid` |
+| `telemetry_unavailable` | the Codex RPC failed, timed out or is disabled (never softened) | none (the caller has no Codex probe; nearest is `stale_telemetry`) |
+| `telemetry_malformed` | the tool's own quota cache file is not exactly readable (never softened) | none (the caller's `malformed_telemetry` covers its snapshot file) |
+| `ledger_cooling` | an active health-ledger flag covers this quota pool's road account, window or model (never softened) | none |
+| `ledger_unreadable` | the health ledger is not exactly readable (never softened) | none (the caller reads no ledger) |
+| `unknown_account` | the policy lists no such account for the login | none |
+| `hard_rate_limit` | an active incident marker for this quota pool and account, or a marker that is not exactly readable (never softened) | `hard_rate_limit` (advisory for a short task in the caller) |
+
+The caller's `shared_pool`, `budget_exhausted`, `unknown_seat`, `unknown_pool`, `local_always_eligible` and `override` have no counterpart here: seats, the fallback intersection and overrides stay with the caller.
+
+### Known shadow classes
+
+These are deliberate differences between this interface and the caller's own eligibility rule (`eligibility.py check`). They are not defects; a caller that mirrors this interface must keep them in mind.
+
+- **caller advisory / tool ineligible on invalid evidence.** For `--task-class short` the caller turns missing, stale or malformed telemetry (and a hard rate limit or exhausted budget) into `advisory`. This tool refuses invalid or unverifiable evidence for long and short tasks alike (Owner ruling 2026-11-18): missing, unreadable, malformed, stale, future-dated beyond tolerance, bound to another account or home, or a failed or timed-out RPC is `ineligible`, exit 10. Only a valid, correctly bound observation at or over the threshold is `advisory`. The caller's softer mapping is the caller's own rule.
+- **caller advisory / tool ineligible on hard_rate_limit for short tasks.** For `--task-class short` the caller turns an active hard rate limit into `advisory`. This tool refuses an active or unreadable incident marker for long and short tasks alike: only `quota_reserve` on valid evidence is softened.
+- **fallback is long-only in the caller.** The caller walks a fallback chain only for long tasks. `--context fallback` here is a quota check of one candidate quota pool (an `unmonitored` quota pool is refused as a fallback target); it never walks a chain and never evaluates a short task's fallback.
+- **account binding.** The caller's registry keeps one quota pool per login and ignores `--account`. This tool binds a monitored quota pool to the `default` account only and refuses a snapshot that names another account.
+
+### Output failure
+
+If stdout cannot be written (a closed pipe, a failing stream), the command prints one fixed line, `quota: cannot write the result`, on stderr, with no traceback and no path, and exits 74. The decision is still audited before the write. The exit code carries no decision: the caller must treat 74 as no answer.
+
+### Output: `quota-decision/v1`
+
+One JSON object, built from an allowlist with value validation (enums, bounded numbers, ISO timestamps, validated ids). Profile and identity objects are never copied in. Fields, in order:
+
+`interface_version` (`quota-decision/v1`), `decision_id` (uuid4), `decision`, `reasons` (list from the enum), `quota_pool`, `login`, `account`, `used_bp` (0..10000), `window` (`primary`, `secondary`, or the snapshot's window name), `observed_at`, `freshness_s`, `policy_revision`, `checked_at`, `expires_at`.
+
+Fields are `null` when there is no evidence for them (and `quota_pool`, `login`, `account` when the policy does not know them). `expires_at` is `checked_at + min(remaining freshness, 300 s)` for a decision built on valid evidence, and `checked_at + 300 s` for a configuration refusal with no evidence behind it. Every decision built on invalid, stale, unavailable or unreadable evidence (`stale_telemetry`, `missing_telemetry`, `malformed_telemetry`, `telemetry_unavailable`, `telemetry_malformed`, `ledger_unreadable`, `registry_invalid`) expires at `checked_at`, a future-dated observation included. A caller that caches a decision must not reuse it after `expires_at`.
+
+### Audit
+
+Every decision appends one line to `<state dir>/quota-audit.jsonl`: the same allowlisted object that was printed, plus the audit-only `incident_state` when an incident marker exists (see "Incidents"). The file is created with mode 0600 and rotates to `quota-audit.jsonl.1` above 5 MiB (one previous generation). Writing the audit is best effort and never changes the decision. Usage errors write no line.
+
+### Contract
+
+`omni contract` carries `"quota": "quota-decision/v1"` and `"quota_incident": "quota-incident/v1"`: static capability markers. It carries no policy, no state and no identity. `CONTRACT_VERSION` is unchanged.
 
 ## Zellij watch pane (optional)
 

@@ -1047,8 +1047,8 @@ class FlagRecheckVisibilityTest(unittest.TestCase):
         key = health.pool_key(model, "default")
         with mock.patch.dict(profile_check.PROBE_POOLS,
                              {road: lambda: model}):
-            # probe_all iterates list_profiles(), which drops every road off
-            # the ring — so the table entry names a pool nothing visits.
+            # probe_all iterates list_profiles(), which drops every road it
+            # does not list — so the table entry names a pool nothing visits.
             self.assertEqual(
                 [r for r in profile_check.list_profiles()
                  if r.get("road") == road], [])

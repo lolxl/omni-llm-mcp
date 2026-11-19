@@ -1413,6 +1413,127 @@ class TestCheckProfiles(_TempHomeCase):
         self.assertEqual(live_calls, [])
 
 
+class TestAgyAccountPool(_TempHomeCase):
+    """agy is listed as one account pool per login (issue #251)."""
+
+    def setUp(self):
+        super().setUp()
+        from providers import health
+        health.clear_all()
+        self.addCleanup(health.clear_all)
+
+    def test_default_row_is_listed_and_unmonitored(self):
+        from providers.profile_check import AGY_STATE, LISTED_ROADS
+        from providers.profiles import RING_ROADS
+        rows = [r for r in list_profiles() if r["road"] == "agy"]
+        self.assertEqual(rows, [{
+            "road": "agy", "name": "default", "source": "default",
+            "path": os.path.join(self.home, ".gemini"), "identity": {},
+            "state": "quota_unmonitored", "problems": [], "cooldown": "healthy",
+        }])
+        self.assertEqual(AGY_STATE, "quota_unmonitored")
+        # Listed, but not on the account ring (no failover, no profiles add).
+        self.assertIn("agy", LISTED_ROADS)
+        self.assertNotIn("agy", RING_ROADS)
+        self.assertFalse(add_profile("agy", "work")["ok"])
+
+    def test_a_config_dir_profile_is_not_a_second_pool(self):
+        # agy does not read AGY_CONFIG_DIR, so a named dir is the same login.
+        work = os.path.join(self.home, "agy-work")
+        os.mkdir(work)
+        os.environ["OMNI_LLM_PROFILE_DISCOVERY"] = "1"
+        os.mkdir(os.path.join(self.home, ".agy-work"))
+        with mock.patch.dict(os.environ, {"AGY_CONFIG_DIR_WORK": work}):
+            names = [r["name"] for r in list_profiles(roads=("agy",))]
+        self.assertEqual(names, ["default"])
+
+    def test_check_live_has_no_agy_probe_and_stays_ok(self):
+        rows = list_profiles(roads=("agy",))
+        with mock.patch("providers.agy.run_agy_subprocess",
+                        side_effect=AssertionError("must not spawn"),
+                        create=True):
+            payload = check(rows, live=True)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["profiles"][0]["state"], "quota_unmonitored")
+        self.assertEqual(payload["profiles"][0]["problems"], [])
+
+    def test_cooldown_covers_every_record_on_the_login(self):
+        from providers import health
+        from providers.config import DEFAULT_MODEL
+
+        def cooldown():
+            return self._row("agy", "default")[0]["cooldown"]
+
+        self.assertEqual(cooldown(), "healthy")
+        # Every spelling of an agy model, the account key, and a named
+        # profile (the same login: agy does not read AGY_CONFIG_DIR).
+        for model, profile in ((DEFAULT_MODEL, "default"),
+                               ("agy/%s" % DEFAULT_MODEL, "default"),
+                               ("agy/gemini-other-synthetic", "default"),
+                               ("AGY/gemini-other-synthetic", "default"),
+                               ("google/gemini-other-synthetic", "default"),
+                               ("agy", "default"),
+                               ("agy#week", "default"),
+                               (DEFAULT_MODEL, "work")):
+            health.clear_all()
+            health.flag(model, profile, source="rate_limit")
+            self.assertEqual(cooldown(), "cooling", (model, profile))
+        # Records on other roads do not cool the agy login, including a
+        # cursor bucket key, whose bare text would otherwise route to agy.
+        # Bare nicknames of other vendors also route to agy by default, so a
+        # bare name other than the default model is not counted (documented).
+        for model in ("codex", "grok-4.6", "claude/opus", "CLAUDE/opus",
+                      "cursor/auto", "cursor/composer-2.5", "opus", "fable",
+                      "sol", "luna", "Gemini Other Synthetic"):
+            health.clear_all()
+            health.flag(model, "default", source="rate_limit")
+            self.assertEqual(cooldown(), "healthy", model)
+        # A bare id or name in that profile's agy catalog is what agy
+        # admission accepts, so it counts; without a catalog it does not.
+        catalog = {"models": [
+            {"id": "gemini-synthetic-high", "name": "Gemini Synthetic (High)"},
+            {"id": "gemini-work-only", "name": "Gemini Work Only"},
+            # Listed but not admitted: another road owns the id, and a
+            # name two rows share is ambiguous for agy admission.
+            {"id": "gpt-5.6", "name": "Shared Synthetic"},
+            {"id": "gemini-shared-a", "name": "Gemini Shared"},
+            {"id": "gemini-shared-b", "name": "Gemini Shared"}]}
+
+        def fake_load(provider, profile):
+            if provider == "agy" and profile in ("default", "work"):
+                return catalog, None
+            return None, None
+
+        with mock.patch("providers.catalog_v2.load", side_effect=fake_load):
+            for model, profile in (("gemini-synthetic-high", "default"),
+                                   ("Gemini Synthetic (High)", "default"),
+                                   ("gemini-work-only", "work")):
+                health.clear_all()
+                health.flag(model, profile, source="rate_limit")
+                self.assertEqual(cooldown(), "cooling", (model, profile))
+            for model in ("opus", "gemini-not-listed", "gpt-5.6",
+                          "Gemini Shared"):
+                health.clear_all()
+                health.flag(model, "default", source="rate_limit")
+                self.assertEqual(cooldown(), "healthy", model)
+            health.clear_all()
+            health.flag("gemini-synthetic-high", "other", source="rate_limit")
+            self.assertEqual(cooldown(), "healthy")
+
+    def test_probe_all_reports_no_signal_for_agy(self):
+        from providers import profile_check
+
+        def no_oracle(profile):
+            raise AssertionError("agy has no quota oracle: %s" % profile)
+
+        with mock.patch("providers.codex_quota.read_rate_limits",
+                        side_effect=no_oracle):
+            quota = profile_check.probe_all(roads=("agy",))
+        self.assertEqual(quota, {"agy": {"default": {
+            "signal": "none", "cooldown": "healthy"}}})
+        self.assertNotIn("agy", profile_check.probe_covered_roads())
+
+
 class TestAddProfile(_TempHomeCase):
     def test_creates_0700_dir_and_login_command(self):
         env = add_profile("claude", "work")

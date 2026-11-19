@@ -1,0 +1,61 @@
+{
+  "policy_schema": "quota-policy/v1",
+  "reserve_threshold_bp": 9000,
+  "decision_ttl_cap_s": 300,
+  "codex_rpc": {
+    "cache_freshness_s": 60,
+    "timeout_s": 5,
+    "future_tolerance_seconds": 5
+  },
+  "anthropic_snapshot": {
+    "max_age_seconds": 7200,
+    "future_tolerance_seconds": 300
+  },
+  "pools": {
+    "openai-sub": {
+      "login": "openai",
+      "road": "codex",
+      "accounts": [
+        "default"
+      ],
+      "profile": "default",
+      "monitoring": "codex_rpc"
+    },
+    "xai-sub": {
+      "login": "xai",
+      "road": "grok",
+      "accounts": [
+        "default"
+      ],
+      "profile": "default",
+      "monitoring": "unmonitored"
+    },
+    "google-sub": {
+      "login": "google",
+      "road": "agy",
+      "accounts": [
+        "default"
+      ],
+      "profile": "default",
+      "monitoring": "unmonitored"
+    },
+    "cursor-sub": {
+      "login": "cursor",
+      "road": "cursor",
+      "accounts": [
+        "default"
+      ],
+      "profile": "default",
+      "monitoring": "unmonitored"
+    },
+    "anthropic-sub": {
+      "login": "anthropic",
+      "road": "claude",
+      "accounts": [
+        "default"
+      ],
+      "profile": "default",
+      "monitoring": "anthropic_snapshot"
+    }
+  }
+}

@@ -370,6 +370,27 @@ class TestProfilesCli(unittest.TestCase):
         self.assertEqual(ck.call_args.kwargs.get("live"), True)
         self.assertFalse(json.loads(out)["ok"])
 
+    def test_list_accepts_the_agy_road(self):
+        listed = [{
+            "road": "agy", "name": "default", "source": "default",
+            "path": "/x", "identity": {}, "state": "quota_unmonitored",
+            "problems": [], "cooldown": "healthy",
+        }]
+        with mock.patch("providers.profile_check.list_profiles",
+                        return_value=listed) as lp:
+            code, out, _, calls = run_cli(
+                ["profiles", "list", "--json", "--road", "agy"], {"ok": True})
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(lp.call_args.kwargs.get("roads"), ("agy",))
+        self.assertEqual(json.loads(out)["profiles"], listed)
+
+    def test_list_refuses_a_road_it_does_not_list(self):
+        code, out, _, _calls = run_cli(
+            ["profiles", "list", "--json", "--road", "pi"], {"ok": True})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(json.loads(out)["reason"], "profile_config")
+
     def test_add_maps_persist_json(self):
         envelope = {
             "ok": True, "road": "claude", "name": "work",

@@ -11,6 +11,8 @@ import os
 from providers import dispatch_exec, dispatch_result
 from providers.dispatch import TOOLS
 from providers.health import DEFAULT_STATE_DIR, ENV_STATE_DIR
+from providers.quota import INCIDENT_INTERFACE as QUOTA_INCIDENT_INTERFACE
+from providers.quota import INTERFACE_VERSION as QUOTA_INTERFACE
 from providers.version import CONTRACT_VERSION, SERVER_NAME, __version__
 
 
@@ -40,5 +42,8 @@ def build_contract(parser):
         "dispatch_exec": {"result_record_version": dispatch_result.VERSION,
                           "providers": [dispatch_exec.PROVIDER],
                           "exit_codes": dict(dispatch_exec.EXIT_CODES)},
+        # Static capability only: no policy, no state, no identity.
+        "quota": QUOTA_INTERFACE,
+        "quota_incident": QUOTA_INCIDENT_INTERFACE,
         "state_dir": state_dir(),
     }

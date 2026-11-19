@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -692,7 +693,10 @@ class ExpiryLockCliTest(RecoveryCase):
     def test_p_malformed_ledger_and_cache_recover(self):
         with open(os.path.join(self.state, "health.json"), "w") as handle:
             handle.write("{not json")
-        with open(os.path.join(self.state, "quota.json"), "w") as handle:
+        row_dir = os.path.join(self.state, "quota")
+        os.makedirs(row_dir)
+        row_path = os.path.join(row_dir, hashlib.sha256(b"default").hexdigest() + ".json")
+        with open(row_path, "w") as handle:
             handle.write("[")
 
         async def router(prompt, model, *a, **k):
@@ -705,10 +709,12 @@ class ExpiryLockCliTest(RecoveryCase):
         path = os.path.join(self.state, "health.json")
         data = json.load(open(path, encoding="utf-8"))
         self.assertIn(health.pool_key("m3", "default"), data)
-        health.write_quota_cache({"default": {"used_percent": 1,
-                                              "checked_at": time.time()}})
-        cached = health.read_quota_cache()
-        self.assertIn("default", cached)
+        self.assertIsNone(health.get_quota_row("default"))
+        self.assertTrue(health.put_quota_row(
+            "default", {"used_percent": 1, "checked_at": time.time()}))
+        cached = health.get_quota_row("default")
+        self.assertEqual(cached["used_percent"], 1)
+        self.assertEqual(cached["profile"], "default")
 
     def test_q_lock_held_skips_mutation(self):
         health.flag("keep", "default", source="rate_limit")
@@ -810,6 +816,20 @@ class ExpiryLockCliTest(RecoveryCase):
         self.assertEqual(rc, 0)
         self.assertNotIn(key, health.snapshot())
 
+    def _state_blobs(self):
+        """The ledger and every per-profile quota cache file, as text."""
+        paths = [os.path.join(self.state, "health.json")]
+        quota_dir = os.path.join(self.state, "quota")
+        if os.path.isdir(quota_dir):
+            paths.extend(os.path.join(quota_dir, name)
+                         for name in sorted(os.listdir(quota_dir)))
+        blobs = []
+        for path in paths:
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as handle:
+                    blobs.append(handle.read())
+        return blobs
+
     def test_r_canary_pii_never_surfaces(self):
         import omni_cli
         os.environ["FAKE_CODEX_MODE"] = "canary"
@@ -820,10 +840,10 @@ class ExpiryLockCliTest(RecoveryCase):
             rc = omni_cli.main(["health", "--probe"])
         self.assertEqual(rc, 0)
         blobs = [stdout.getvalue(), stderr.getvalue()]
-        for name in ("health.json", "quota.json"):
-            path = os.path.join(self.state, name)
-            if os.path.isfile(path):
-                blobs.append(open(path, encoding="utf-8").read())
+        state_blobs = self._state_blobs()
+        # the probe wrote its cache file, so the scan below is not vacuous
+        self.assertTrue(os.listdir(os.path.join(self.state, "quota")))
+        blobs.extend(state_blobs)
         self.assertFalse(self._canary_in(*blobs), blobs[:2])
 
         async def router(prompt, model, *a, **k):
@@ -839,10 +859,7 @@ class ExpiryLockCliTest(RecoveryCase):
             _run(dispatch.dispatch_llm_request(
                 "p", "codex/gpt-5.6-sol,backup", 30, None, "default"))
         blobs2 = [stdout2.getvalue(), stderr2.getvalue()]
-        for name in ("health.json", "quota.json"):
-            path = os.path.join(self.state, name)
-            if os.path.isfile(path):
-                blobs2.append(open(path, encoding="utf-8").read())
+        blobs2.extend(self._state_blobs())
         self.assertFalse(self._canary_in(*blobs2))
 
     def test_x_error_message_canary_never_surfaces(self):

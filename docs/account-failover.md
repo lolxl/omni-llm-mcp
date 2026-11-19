@@ -68,6 +68,31 @@ recovery remains available. Adding Grok to the registry does not add it to
 `probe_covered_roads`: that set describes actual quota oracle coverage, which
 remains Codex only.
 
+`profiles list` and `check` also list agy as one row, `default`. On macOS, where
+the fenced CLI is the only agy path, agy keeps its Google login in the login
+keychain and does not read `AGY_CONFIG_DIR` (docs/reference.md, measured on agy
+1.3.3), so an `AGY_CONFIG_DIR_<NAME>` is not a second login and is not listed.
+Off macOS the SDK path does read `AGY_CONFIG_DIR`; a separate login selected that
+way is not listed either, and shares this row. agy is not on the account ring, has no `profiles add` and no
+`check --live` probe. A caller that keeps account pools maps the row's road and
+name (`agy@default`) to one pool. The row has `identity: {}`: omni reads no
+account id for agy.
+Its state is `quota_unmonitored`, and its scheduled-probe entry is
+`{"signal": "none"}`: agy exposes no usage or quota oracle, so no remaining
+quota is reported. `quota_unmonitored` differs from Grok's `quota_unknown`: Grok
+is on the ring and its eligibility uses runtime failures, whereas agy is listed
+only so the login can be named. The row's `cooldown` is the worst of the health
+records on this login, on any `account_profile`: every `<prefix>/<id>` key the
+router sends to agy (`agy/<id>` in any case), the account key `agy`, the shipped
+default model, and a bare spelling that routes to agy and that agy admission
+accepts for that profile (an unambiguous id or name in its catalog). Other bare
+names are not counted: a bare nickname of another vendor (`opus`, `sol`) routes
+to agy by default but admission refuses it, and a catalog id another road owns
+(`gpt-5.6`) routes elsewhere. A cooldown on one agy model shows the whole row as
+cooling. `check` does not tell whether agy is installed or logged in (it has no
+live probe); use `omni models status` and `omni models admit` for the agy
+catalog.
+
 Codex, Claude and Grok never re-run a failed attempt within the same request:
 not on another account, not on the same account after a backoff, and not on a
 later seat of a fallback chain. (The other providers keep their bounded backoff

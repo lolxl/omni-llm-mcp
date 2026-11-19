@@ -349,7 +349,14 @@ for line in sys.stdin:
             self.assertNotIn("CODEX_API_KEY", row["env"])
             self.assertNotIn("OPENAI_API_KEY", row["env"])
         self.assertNotIn("synthetic-private", json.dumps(first))
-        self.assertNotIn(self.homes["a"], json.dumps(health.read_quota_cache()))
+        stored = health.get_quota_row("a")
+        self.assertEqual(stored["used_percent"], 20)   # the remapped home's reply
+        quota_dir = os.path.join(self.root, "quota")
+        names = sorted(os.listdir(quota_dir))
+        self.assertTrue(names)
+        for name in names:   # the raw text of every cache file, not one parsed row
+            with open(os.path.join(quota_dir, name), encoding="utf-8") as handle:
+                self.assertNotIn(self.homes["a"], handle.read())
         self.assertEqual(os.environ["OPENAI_API_KEY"], before["OPENAI_API_KEY"])
 
     def test_quota_rpc_error_sanitizes_message_preserving_auth_reason(self):

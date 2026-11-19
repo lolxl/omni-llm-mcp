@@ -203,6 +203,10 @@ def build_parser():
 
     sub.add_parser("session", help="local session table and peer routing")
 
+    sub.add_parser("quota", help="quota-pool eligibility for one login and account "
+                                 "(check, policy show; JSON, quota-decision/v1)",
+                   add_help=False)
+
     sub.add_parser("host-exec", help="exec a task command under the macOS host fence",
                    add_help=False)
 
@@ -421,7 +425,7 @@ def build_parser():
     profiles_filter = argparse.ArgumentParser(add_help=False)
     profiles_filter.add_argument(
         "--road", default=None, dest="profiles_road",
-        help="limit to one road (claude / codex / grok / cursor)",
+        help="limit to one road (claude / codex / grok / cursor / agy)",
     )
     profiles_filter.add_argument(
         "--name", default=None, dest="profiles_name",
@@ -1118,8 +1122,8 @@ def _main_profiles_schedule(ns):
 
 def _main_profiles(ns):
     """profiles / profiles check / profiles add — CLI-only, never MCP."""
-    from providers.profile_check import add_profile, check, list_profiles
-    from providers.profiles import RING_ROADS
+    from providers.profile_check import (
+        LISTED_ROADS, add_profile, check, list_profiles)
 
     cmd = getattr(ns, "profiles_cmd", None)
     if cmd == "schedule":
@@ -1128,10 +1132,10 @@ def _main_profiles(ns):
     road = getattr(ns, "profiles_road", None)
     if road:
         road = str(road).strip().lower()
-        if road not in RING_ROADS:
+        if road not in LISTED_ROADS:
             return _emit({"ok": False, "reason": "profile_config",
-                          "detail": "unknown road (ring is claude/codex/grok/cursor "
-                                    "only)"})
+                          "detail": "unknown road (listed roads are "
+                                    "claude/codex/grok/cursor/agy only)"})
 
     if cmd == "add":
         if getattr(ns, "exec_login", False) and not sys.stdin.isatty():
@@ -1444,6 +1448,10 @@ def main(argv=None):
     if argv[:1] == ["dispatch-exec"]:
         from providers.dispatch_exec import main as dispatch_exec
         return dispatch_exec(argv[1:])
+    if argv[:1] == ["quota"]:
+        # providers.quota owns all parsing, so no argument value is echoed here.
+        from providers.quota import main as quota_main
+        return quota_main(argv[1:])
     if _is_agent_job_invocation(argv):
         return _main_agent_job(argv[1:])
     parser = build_parser()

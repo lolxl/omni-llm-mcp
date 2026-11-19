@@ -27,5 +27,9 @@ omni = "omni_cli:main"
 py-modules = ["omni_cli"]
 packages = ["providers"]
 
+# quota_policy.json is read at run time next to providers/quota.py.
+[tool.setuptools.package-data]
+providers = ["quota_policy.json"]
+
 [tool.setuptools.dynamic]
 version = { attr = "providers.version.__version__" }

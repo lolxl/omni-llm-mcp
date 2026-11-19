@@ -1,12 +1,15 @@
 # no-opencc
 """Best-effort seat health ledger, Codex quota probe, and half-open recovery."""
+import contextlib
 import errno
 import fcntl
 import glob
+import hashlib
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 from collections import deque
@@ -33,6 +36,7 @@ CRASH_COOLDOWN_S = 5 * 60
 _CRASH_REASONS = frozenset(("runtime_error", "signal_exit"))
 FLAG_WINDOW_S = 60 * 60
 HEALTH_LOCK_WAIT_S = 2.0
+QUOTA_LOCK_NAME = "quota.lock"
 _LOCK_POLL_S = 0.02
 _LOCK_SKIPPED = object()
 _RECOVERABLE_SOURCES = frozenset((
@@ -254,8 +258,9 @@ def _lock_path():
     return os.path.join(_state_dir(), "health.lock")
 
 
-def _quota_path():
-    return os.path.join(_state_dir(), "quota.json")
+def _quota_dir():
+    """Directory of the per-profile Codex quota cache files."""
+    return os.path.join(_state_dir(), "quota")
 
 
 def _flag_window_path():
@@ -284,13 +289,25 @@ def _as_timestamp(value):
         return None
 
 
+def _quiet_log_event(event, **fields):
+    """Write one diagnostic line; a failing write drops the line.
+
+    The cache paths log while they hold a row's fate (a drop's unlink, a put's
+    result): a stderr pipe with no reader must not change what they return.
+    """
+    try:
+        log_event(event, **fields)
+    except Exception:
+        pass
+
+
 def _log_malformed(path):
     key = os.path.abspath(path)
     if key in _malformed_logged:
         return
     _malformed_logged.add(key)
-    log_event("health_error", operation="malformed_file",
-              detail="malformed_state_json")
+    _quiet_log_event("health_error", operation="malformed_file",
+                     detail="malformed_state_json")
 
 
 def _log_probe_coverage_error(detail):
@@ -346,7 +363,7 @@ def _read_ledger_unlocked():
         return {}
 
 
-def _atomic_write_json(path, data):
+def _atomic_write_json(path, data, allow_nan=True):
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix=".omni-", suffix=".tmp", dir=directory)
@@ -354,7 +371,8 @@ def _atomic_write_json(path, data):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             open_fd = None
-            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True,
+                      allow_nan=allow_nan)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -446,32 +464,466 @@ def _locked_mutate(operation, mutator):
     return result
 
 
-def read_quota_cache():
-    """Load quota.json under the ledger lock. Lock skip -> empty dict."""
-    handle = try_exclusive_lock(_lock_path(), HEALTH_LOCK_WAIT_S)
-    if handle is None:
-        return {}
+class StrictReadError(Exception):
+    """A state file the quota decision needs could not be read exactly.
+
+    ``reason`` is ``ledger_unreadable`` or ``telemetry_malformed``. No path,
+    value or exception text is kept: the message is the reason alone.
+    """
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _strict_reject_constant(_name):
+    raise ValueError("non-finite number")
+
+
+def _strict_reject_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("non-finite number")
+    return value
+
+
+def _strict_pairs(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def strict_json_loads(text):
+    """Decode *text* as JSON for every strict read of the quota decision.
+
+    A duplicate key at any depth, ``NaN``/``Infinity``/``-Infinity`` and a
+    number that is not finite after decode (``1e999``) raise ValueError, as
+    does any malformed JSON. Callers map that to their own reason.
+    """
+    return json.loads(text, object_pairs_hook=_strict_pairs,
+                      parse_constant=_strict_reject_constant,
+                      parse_float=_strict_reject_float)
+
+
+class _ReadTooLarge(StrictReadError):
+    """A bounded strict read found more bytes than its limit allows."""
+
+
+def _strict_read_maybe(path, reason, dir_fd=None, max_bytes=None):
+    """Return the JSON object at *path*, or ``None`` when the file is absent.
+
+    Unlike :func:`_read_json_object` nothing is forgiven: a read error,
+    malformed JSON, a duplicate key, NaN/Infinity or a root that is not an
+    object raises :class:`StrictReadError`. A symbolic link at *path*, dangling
+    or not, is unreadable: only a regular file is read, and it is opened
+    without following a link, so a link swapped in after a check cannot be
+    followed. Reads without a lock: every writer replaces the file
+    atomically.
+
+    With *dir_fd*, *path* is a name relative to that open directory. With
+    *max_bytes* the read is bounded: a file with more bytes raises
+    :class:`_ReadTooLarge` (a StrictReadError) without being read whole.
+    """
     try:
-        try:
-            return _read_json_object(_quota_path())
-        except OSError:
-            log_event("health_error", operation="read", detail="state_unreadable")
-            return {}
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise StrictReadError(reason)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise StrictReadError(reason)
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise _ReadTooLarge(reason)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+        if max_bytes is not None and len(raw) > max_bytes:
+            raise _ReadTooLarge(reason)
+        data = strict_json_loads(raw.decode("utf-8"))
+    except StrictReadError:
+        raise
+    except (OSError, ValueError, RecursionError):
+        # ValueError covers JSONDecodeError and UnicodeDecodeError.
+        raise StrictReadError(reason)
     finally:
-        release_lock(handle)
+        os.close(fd)
+    if not isinstance(data, dict):
+        raise StrictReadError(reason)
+    return data
 
 
-def write_quota_cache(data):
-    """Atomically replace quota.json under the ledger lock. False on skip."""
-    handle = try_exclusive_lock(_lock_path(), HEALTH_LOCK_WAIT_S)
-    if handle is None:
-        log_event("health_skipped", operation="quota_cache")
+def _strict_read_object(path, reason):
+    """Return the JSON object at *path*; ``{}`` only when the file is absent.
+
+    See :func:`_strict_read_maybe` for what is refused.
+    """
+    data = _strict_read_maybe(path, reason)
+    return {} if data is None else data
+
+
+_STRICT_FLAG_MARKERS = ("source", "flagged_at", "probe_after")
+
+
+def _strict_timestamp_ok(value):
+    """True for a present expiry that parses to a finite timestamp."""
+    ts = _as_timestamp(value)
+    return ts is not None and math.isfinite(ts)
+
+
+def strict_ledger_snapshot():
+    """Return the whole ledger exactly as stored, or raise StrictReadError.
+
+    A missing ``health.json`` is an empty ledger (first run). Every row must
+    be an object. A present ``until`` (null included) or a ``credit_hold.until``
+    must parse to a finite timestamp; a row with no ``until`` and no flag
+    marker (a crash-streak counter) is valid. A symbolic link is unreadable.
+    The lenient readers keep their callers; this is a separate path.
+    """
+    data = _strict_read_object(_ledger_path(), "ledger_unreadable")
+    for key, row in data.items():
+        if not isinstance(row, dict):
+            raise StrictReadError("ledger_unreadable")
+        if key == _LEASES_KEY:
+            continue
+        # A flag row always carries a finite expiry: a present ``until`` of
+        # null or any other bad value, or flag markers without one, are
+        # unreadable. Only a row with neither (a crash-streak counter) has none.
+        if "until" in row:
+            if not _strict_timestamp_ok(row["until"]):
+                raise StrictReadError("ledger_unreadable")
+        elif any(marker in row for marker in _STRICT_FLAG_MARKERS):
+            raise StrictReadError("ledger_unreadable")
+        if "credit_hold" in row:
+            hold = row["credit_hold"]
+            if not isinstance(hold, dict) or not _strict_timestamp_ok(
+                    hold.get("until")):
+                raise StrictReadError("ledger_unreadable")
+    return data
+
+
+def _strict_number(value):
+    """True for a finite int or float (a bool is not a number here)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:
-        _atomic_write_json(_quota_path(), data if isinstance(data, dict) else {})
-        return True
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _strict_cache_window_ok(window):
+    """Basic types of one quota-cache window (the row itself or ``secondary``)."""
+    for name in ("used_percent", "resets_at"):
+        if window.get(name) is not None and not _strict_number(window[name]):
+            return False
+    mins = window.get("window_mins")
+    if mins is not None and (isinstance(mins, bool) or not isinstance(mins, int)):
+        return False
+    for name in ("reached", "primary_reached"):
+        if name in window and not isinstance(window[name], bool):
+            return False
+    return True
+
+
+def _strict_cache_row_ok(row):
+    """True for a well-typed quota-cache row.
+
+    An object with a finite-number ``checked_at``, and finite number or null
+    ``used_percent`` and ``resets_at``, int or null ``window_mins``, bool
+    ``reached``/``primary_reached``, str ``home_id``, str or null ``plan`` and
+    bool ``quota_unknown`` when present; ``secondary`` is an object of the
+    same types, or absent.
+    """
+    if not isinstance(row, dict) or not _strict_number(row.get("checked_at")):
+        return False
+    if "home_id" in row and not isinstance(row["home_id"], str):
+        return False
+    # The writer stores ``plan`` as a str or null and ``quota_unknown`` only as true.
+    if "plan" in row and row["plan"] is not None and not isinstance(row["plan"], str):
+        return False
+    if "quota_unknown" in row and not isinstance(row["quota_unknown"], bool):
+        return False
+    windows = [row]
+    if "secondary" in row:
+        if not isinstance(row["secondary"], dict):
+            return False
+        windows.append(row["secondary"])
+    return all(_strict_cache_window_ok(window) for window in windows)
+
+
+# One cache file per Codex profile: <state_dir>/quota/<sha256 of the label>.json.
+# The file holds the row plus ``"profile": <label>``. A write touches only its
+# own file; nothing on these paths takes the ledger lock.
+
+QUOTA_ROW_MAX_BYTES = 64 * 1024     # a row is a few hundred bytes; more is malformed
+
+
+def _quota_row_path(profile):
+    """Return ``(label, name)`` of one profile's cache file.
+
+    *name* is relative to the cache directory. Raises ValueError when the
+    label cannot be encoded.
+    """
+    label = _profile_value(profile)
+    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()
+    return label, digest + ".json"
+
+
+def _quota_dir_checked():
+    """Test seam: called once the cache directory descriptor is verified."""
+
+
+def _open_quota_dir(create=False):
+    """Open the cache directory and return its descriptor, or None when absent.
+
+    The directory is opened once, without following a link at its own name,
+    and checked on the descriptor: a real directory owned by the current user.
+    Every later read, create, rename and unlink of one operation goes through
+    that descriptor, so replacing the name afterwards changes nothing. A link,
+    a file or a directory of another user at that name raises
+    :class:`StrictReadError`. With *create* an absent directory is made
+    (mode 0700) and opened.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(_quota_dir(), flags)
+    except FileNotFoundError:
+        if not create:
+            return None
+        os.makedirs(_state_dir(), exist_ok=True)
+        try:
+            os.mkdir(_quota_dir(), 0o700)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(_quota_dir(), flags)
+        except OSError:
+            raise StrictReadError("telemetry_malformed")
+    except OSError:
+        raise StrictReadError("telemetry_malformed")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise StrictReadError("telemetry_malformed")
+        _quota_dir_checked()
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def _quota_dir_fd(create=False):
+    """Yield the verified cache directory descriptor (None when absent)."""
+    fd = _open_quota_dir(create)
+    try:
+        yield fd
     finally:
-        release_lock(handle)
+        if fd is not None:
+            os.close(fd)
+
+
+def _write_file_at(dir_fd, name, payload):
+    """Atomically create or replace *name* in the open directory with *payload*.
+
+    The temp file is created exclusively, without following a link, relative
+    to *dir_fd*; it is fsynced, renamed over *name* inside that directory and
+    the directory is fsynced; a failed directory fsync raises OSError. A
+    failure before the rename leaves no temp file behind.
+    """
+    temp = ".omni-%s.tmp" % os.urandom(8).hex()
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=dir_fd)
+    try:
+        try:
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(temp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    # The rename is not durable until the directory is synced: a failed sync
+    # is a failed write (OSError), whatever state the name is left in.
+    os.fsync(dir_fd)
+
+
+def _write_row_at(dir_fd, name, data):
+    """Write the JSON object *data* as one cache file; NaN or infinity raise ValueError."""
+    text = json.dumps(data, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    _write_file_at(dir_fd, name, (text + "\n").encode("utf-8"))
+
+
+def _read_quota_row_at(dir_fd, label, name):
+    """Return the row in *name* of the open directory, ``None`` when absent.
+
+    The read is bounded by :data:`QUOTA_ROW_MAX_BYTES`; a larger file is malformed.
+    """
+    row = _strict_read_maybe(name, "telemetry_malformed", dir_fd=dir_fd,
+                             max_bytes=QUOTA_ROW_MAX_BYTES)
+    if row is None:
+        return None
+    if not _strict_cache_row_ok(row) or row.get("profile") != label:
+        raise StrictReadError("telemetry_malformed")
+    return row
+
+
+def _is_regular_at(dir_fd, name):
+    try:
+        return stat.S_ISREG(os.stat(name, dir_fd=dir_fd,
+                                    follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _note_malformed_row_at(dir_fd, label, name):
+    """Log (once) a regular cache file that is malformed; refuse anything else.
+
+    Returns normally when the file is absent, well-formed or a malformed
+    regular file (after logging it). A link or a non-regular file raises
+    :class:`StrictReadError`. An oversized or unreadable regular file counts
+    as malformed: whatever the read does, a regular file is logged (one fixed
+    reason) and the caller may go on to replace or unlink it.
+    """
+    try:
+        _read_quota_row_at(dir_fd, label, name)
+    except (StrictReadError, OSError, ValueError, RecursionError):
+        if not _is_regular_at(dir_fd, name):
+            raise StrictReadError("telemetry_malformed")
+        _log_malformed(os.path.join(_quota_dir(), name))
+
+
+def _read_quota_row(profile):
+    """Return one profile's row, or ``None`` when its file is absent.
+
+    A present file that is undecodable, not an object, fails the row checks or
+    names another label raises ``StrictReadError("telemetry_malformed")``, as
+    does a cache directory or file that is not a real directory or regular file.
+    """
+    try:
+        label, name = _quota_row_path(profile)
+    except ValueError:
+        raise StrictReadError("telemetry_malformed")
+    with _quota_dir_fd() as dir_fd:
+        if dir_fd is None:
+            return None
+        return _read_quota_row_at(dir_fd, label, name)
+
+
+def strict_quota_cache_row(profile):
+    """Return one profile's cache row exactly as stored, or raise StrictReadError.
+
+    ``None`` means the profile's file is truly absent. Only this profile's file
+    is read: a malformed file of another profile does not matter. The old
+    one-file cache is never read.
+    """
+    return _read_quota_row(profile)
+
+
+def get_quota_row(profile):
+    """Lenient read of one profile's row: ``None`` when absent or unusable."""
+    try:
+        return _read_quota_row(profile)
+    except StrictReadError:
+        return None
+
+
+def _log_quota_cache_error(detail):
+    _quiet_log_event("health_error", operation="quota_cache", detail=detail)
+
+
+def put_quota_row(profile, row):
+    """Replace one profile's cache file with *row*; other files are untouched.
+
+    Returns True when written and the rename is durable (the directory was
+    fsynced); a failed directory fsync returns False. A NaN or infinity in
+    *row*, an unusable cache directory or a profile file that is a link or not
+    a regular file writes nothing and logs one fixed line. An existing file
+    that is malformed is logged once and then replaced. After a published row
+    the old one-file cache, if any, is deleted (best effort, never read).
+    """
+    try:
+        label, name = _quota_row_path(profile)
+        with _quota_dir_fd(create=True) as dir_fd:
+            _note_malformed_row_at(dir_fd, label, name)
+            _write_row_at(dir_fd, name, dict(row, profile=label))
+    except StrictReadError:
+        _log_quota_cache_error("quota_cache_unsafe_path")
+        return False
+    except (OSError, ValueError, TypeError):
+        _log_quota_cache_error("quota_cache_write_failed")
+        return False
+    _remove_old_cache_file()
+    return True
+
+
+def drop_quota_row(profile):
+    """Unlink one profile's cache file; True when it is gone and the unlink is durable.
+
+    A missing file (or directory) is a success. Any failure, an unlink that
+    is refused, an unsafe directory or a link at the file's name, or a failed
+    directory fsync after the unlink, returns False: the caller must not
+    trust that the old row is gone. The file is never read to decide whether
+    to unlink it.
+    """
+    try:
+        label, name = _quota_row_path(profile)
+        with _quota_dir_fd() as dir_fd:
+            if dir_fd is None:     # a directory absent at the open: nothing to drop
+                return True
+            # A malformed regular file is logged once before it goes; a link
+            # or another non-regular file is refused and left alone.
+            _note_malformed_row_at(dir_fd, label, name)
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                return True
+            # An error here, ENOENT included, is not a drop: the unlink is
+            # not known to be durable.
+            os.fsync(dir_fd)
+        return True
+    except StrictReadError:
+        _log_quota_cache_error("quota_cache_unsafe_path")
+    except (OSError, ValueError):
+        _log_quota_cache_error("quota_cache_write_failed")
+    return False
+
+
+_OLD_CACHE_NAME = "quota.json"
+_old_cache_logged = set()
+
+
+def _remove_old_cache_file():
+    """Best effort: delete the one-file cache this layout replaced.
+
+    Nothing ever reads it. It is unlinked by name relative to an open
+    descriptor of the state directory (opened without following a link), so a
+    link at that name is removed, never followed. A failure is logged once per
+    process and ignored.
+    """
+    try:
+        fd = os.open(_state_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.unlink(_OLD_CACHE_NAME, dir_fd=fd)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return
+    except OSError:
+        if "removed" not in _old_cache_logged:
+            _old_cache_logged.add("removed")
+            _log_quota_cache_error("quota_cache_old_file_not_removed")
 
 
 def credit_hold(entry, now=None):
@@ -1009,8 +1461,7 @@ def _flag_entry(model, profile, until=None, source="rate_limit",
         probe_after = now + HALF_OPEN_MIN_S
     try:
         # Already inside a locked mutator (apply_codex_quota / flag).
-        # Nothing beneath this call may take the ledger lock;
-        # read_quota_cache() does.
+        # Nothing beneath this call may take the ledger lock.
         account = _account_identity(stored_model, profile)
     except Exception:
         account = None
@@ -1775,7 +2226,6 @@ def apply_codex_quota(model, profile, info, err):
     def mutator(data):
         # _flag_entry calls _account_identity; this mutator already holds
         # the ledger lock, so nothing beneath that call may take it.
-        # read_quota_cache() does.
         newest = _newest_quota_observed_at(data, model, profile, road)
         if newest is not None and observed_at < newest:
             log_event(

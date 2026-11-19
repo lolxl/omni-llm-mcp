@@ -18,7 +18,8 @@ from providers.dispatch import TOOLS  # noqa: E402
 from providers.version import CONTRACT_VERSION, __version__  # noqa: E402
 
 CLI = os.path.join(HERE, "omni_cli.py")
-KEYS = {"name", "version", "contract_version", "cli", "mcp", "dispatch_exec", "state_dir"}
+KEYS = {"name", "version", "contract_version", "cli", "mcp", "dispatch_exec", "quota",
+        "quota_incident", "state_dir"}
 
 
 def _run(*args, env_extra=None):
@@ -35,7 +36,7 @@ class VersionTests(unittest.TestCase):
         r = _run("--version")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "omni %s\n" % __version__)
-        self.assertEqual(r.stdout.strip(), "omni 0.11.0")
+        self.assertEqual(r.stdout.strip(), "omni 0.12.0")
 
     def test_server_version_is_the_same_source(self):
         self.assertEqual(server.SERVER_VERSION, __version__)

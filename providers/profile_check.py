@@ -19,6 +19,16 @@ from providers.profiles import (
 
 
 DISCOVERY_ENV = "OMNI_LLM_PROFILE_DISCOVERY"
+# Roads ``list_profiles`` enumerates: the account ring plus agy. agy has no
+# ring, no ``profiles add`` and no quota oracle; it is listed so a caller can
+# name its Google login as one account pool (issue #251). Only the default
+# row: on the macOS CLI path (the only agy path there) agy keeps its login in
+# the keychain and does not read AGY_CONFIG_DIR (docs/reference.md, measured
+# on agy 1.3.3), so an AGY_CONFIG_DIR_<NAME> is not a second login and
+# listing it would name one login twice. The row carries
+# ``state: quota_unmonitored`` and its scheduled-probe entry ``signal: none``.
+LISTED_ROADS = RING_ROADS + ("agy",)
+AGY_STATE = "quota_unmonitored"
 LIVE_PROMPT = "Reply with the single word: pong"
 LIVE_TIMEOUT_S = 30
 
@@ -89,7 +99,13 @@ def _seat_model(road):
         return DEFAULT_GROK_MODEL
     if road == "cursor":
         return "cursor/%s" % DEFAULT_CURSOR_MODEL
+    if road == "agy":
+        from providers.config import DEFAULT_MODEL
+        return DEFAULT_MODEL
     return None
+
+
+_COOLDOWN_RANK = {"healthy": 0, "probing": 1, "cooling": 2}
 
 
 def _cooldown(road, name):
@@ -97,7 +113,93 @@ def _cooldown(road, name):
     if not model:
         return None
     from providers import health
+    if road == "agy":
+        return _agy_login_cooldown()
     return health.seat_kind(model, name)
+
+
+def _agy_admission(profile):
+    """Predicate: would a bare request reach agy and be admitted on *profile*?
+
+    True only when the router sends the spelling to agy and agy admission
+    (``admission._decide_agy``, the same decision dispatch uses) admits it
+    against that profile's catalog record, ambiguity checks included. No
+    record, an unreadable one, or any error answers False.
+    """
+    try:
+        from providers import admission, catalog_v2
+        from providers.route import resolve_route
+        record, _err = catalog_v2.load("agy", profile)
+    except Exception:
+        return lambda _bare: False
+    if not isinstance(record, dict):
+        return lambda _bare: False
+    rows = [row for row in record.get("models") or [] if isinstance(row, dict)]
+
+    def admits(bare):
+        try:
+            if resolve_route(bare)["provider"] != "agy":
+                return False
+            decision = admission._decide_agy({"model": bare}, record, rows, [])
+            return decision.get("refusal") is None
+        except Exception:
+            return False
+    return admits
+
+
+def _agy_ledger_record(pool, shape, road, admits=None):
+    """True when the ledger pool *pool* is a record an agy dispatch consults.
+
+    A model-shaped key (``agy/<id>``, ``AGY/<id>``, any ``<prefix>/<id>``
+    routing leaves to agy) is classified by the router itself, so the answer
+    matches where the request went. A bucket key keeps its own road (cursor
+    buckets stay cursor). A bare key counts as the account key ``agy``, the
+    shipped default model, or a spelling *admits* accepts: routed to agy and
+    admitted by agy admission on that key's profile. A bare nickname of
+    another vendor (``opus``, ``sol``) is refused there, and a catalog id that
+    another road owns (``gpt-5.6``) is routed elsewhere, so neither counts.
+    """
+    if shape == "model":
+        from providers.route import resolve_route
+        return resolve_route(pool.split("#", 1)[0])["provider"] == "agy"
+    if shape == "bucket":
+        return road.lower() == "agy"
+    if shape == "account":
+        from providers.config import DEFAULT_MODEL
+        bare = pool.split("#", 1)[0]
+        return (bare.lower() == "agy" or bare == DEFAULT_MODEL
+                or (admits is not None and admits(bare)))
+    return False
+
+
+def _agy_login_cooldown():
+    """Worst seat kind over every ledger record on the agy login.
+
+    The one agy row stands for the one Google login, so every record that
+    :func:`_agy_ledger_record` admits counts, on every ``account_profile``:
+    on the macOS CLI path agy does not read AGY_CONFIG_DIR, so a named
+    profile reaches the same login.
+    """
+    from providers import health
+    kind = "healthy"
+    admissions = {}
+    for key in list(health._read_ledger_unlocked()):
+        if key == health._LEASES_KEY:
+            continue
+        text = str(key)
+        road, shape, _name, _window, profile = health.split_pool_key(text)
+        pool = text.rsplit("@", 1)[0] if "@" in text else text
+        admits = None
+        if shape == "account":
+            if profile not in admissions:
+                admissions[profile] = _agy_admission(profile)
+            admits = admissions[profile]
+        if not _agy_ledger_record(pool, shape, road, admits):
+            continue
+        seen = health.seat_kind(pool, profile)
+        if _COOLDOWN_RANK.get(seen, 0) > _COOLDOWN_RANK.get(kind, 0):
+            kind = seen
+    return kind
 
 
 def _is_safe_regular_file(path):
@@ -215,6 +317,8 @@ def _state_from_identity(road, identity):
     identity = identity or {}
     if road == "grok":
         return "quota_unknown"
+    if road == "agy":
+        return AGY_STATE
     if road == "claude":
         if identity.get("emailAddress") or identity.get("accountUuid"):
             return "identity_cached"
@@ -242,6 +346,8 @@ def _identity_for(road, name, path):
 
 
 def _default_path(road):
+    if road == "agy":
+        return os.path.join(_home(), ".gemini")
     dot = _DOTDIR.get(road)
     if not dot:
         return None
@@ -457,9 +563,9 @@ def _list_road(road):
 
 
 def list_profiles(roads=None):
-    """Return one row dict per profile on *roads* (default: RING_ROADS)."""
+    """Return one row dict per profile on *roads* (default: LISTED_ROADS)."""
     if roads is None:
-        wanted = RING_ROADS
+        wanted = LISTED_ROADS
     elif isinstance(roads, str):
         wanted = (roads,)
     else:
@@ -467,7 +573,7 @@ def list_profiles(roads=None):
     rows = []
     for road in wanted:
         road = str(road or "").strip().lower()
-        if road not in RING_ROADS:
+        if road not in LISTED_ROADS:
             continue
         rows.extend(_list_road(road))
     return rows
@@ -627,7 +733,8 @@ def _check_one(row, live, strict_quota=False):
         checked["problems"] = qprobs
         return checked
 
-    if not live:
+    if not live or _live_probe(checked["road"]) is None:
+        # No live check for this road (agy): the offline answer stands.
         return checked
 
     var, old = None, None
@@ -696,7 +803,7 @@ def _codex_probe_pool():
 # for account-level oracles). ``probe_all`` branches on this table and
 # takes the pool out of it; ``health`` reads the same table to decide
 # ``will_recheck``. Coverage is :func:`probe_covered_roads` (table keys
-# intersect ``RING_ROADS``), a separate question.
+# intersect ``LISTED_ROADS``), a separate question.
 #
 # Scope, so the next road is not added on a false promise: this generalizes
 # WHICH KEY a result lands on, not who answers. ``probe_all`` still asks
@@ -712,18 +819,18 @@ def probe_covered_roads():
     Derived from :data:`PROBE_POOLS` so coverage cannot be declared in one
     place and acted on in another, then narrowed to the roads that can
     actually reach ``probe_all``: it iterates ``list_profiles()`` rows, and
-    that call drops every road outside ``RING_ROADS``. A table entry for a
-    road off the ring names a pool nothing ever visits, so it is not
+    that call drops every road outside ``LISTED_ROADS``. A table entry for a
+    road it does not list names a pool nothing ever visits, so it is not
     coverage. Both facts are read here, so no caller carries the second one.
     """
-    return frozenset(road for road in PROBE_POOLS if road in RING_ROADS)
+    return frozenset(road for road in PROBE_POOLS if road in LISTED_ROADS)
 
 
 def probe_pool_model(road):
     """Pool named for *road* in :data:`PROBE_POOLS`, else ``None``.
 
     This resolves a table entry. It does **not** answer coverage: an entry for
-    a road outside ``RING_ROADS`` resolves here while
+    a road outside ``LISTED_ROADS`` resolves here while
     :func:`probe_covered_roads` excludes it, because ``probe_all`` can never
     receive a row for that road. Anything that needs to know what the
     scheduled probe visits must ask both, the way ``health`` does.

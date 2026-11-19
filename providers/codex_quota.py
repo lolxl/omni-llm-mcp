@@ -29,7 +29,7 @@ STDOUT_CAP_BYTES = 1024 * 1024
 DEFAULT_TIMEOUT_S = 15
 _CLIENT_NAME = "omni-llm-mcp"
 _CLIENT_VERSION = str(getattr(_config, "VERSION", None) or "0")
-_QUOTA_LOCK_NAME = "quota.lock"
+_QUOTA_LOCK_NAME = health.QUOTA_LOCK_NAME
 ENV_QUOTA_PROBE = "OMNI_LLM_QUOTA_PROBE"  # "0" disables the RPC (CI, air-gapped hosts)
 
 
@@ -146,13 +146,13 @@ def read_rate_limits(profile="default", timeout_s=DEFAULT_TIMEOUT_S, force=False
     # the path never enters quota results or diagnostics.
     home_id = hashlib.sha256(home.encode("utf-8")).hexdigest()
     overrides = {**overrides, "CODEX_HOME": home}
+    lock_path = os.path.join(health._state_dir(), _QUOTA_LOCK_NAME)
     if not force:
         cached = _cache_get(profile_text, home_id)
         if cached is not None:
             return cached, None
     if not vendor_bin.which("codex"):
         return None, _err("cli_missing", "codex_cli_missing")
-    lock_path = os.path.join(health._state_dir(), _QUOTA_LOCK_NAME)
     handle = health.try_exclusive_lock(lock_path, timeout_s)
     if handle is None:
         return None, _err("timeout", "quota_lock_timeout")
@@ -161,8 +161,10 @@ def read_rate_limits(profile="default", timeout_s=DEFAULT_TIMEOUT_S, force=False
             cached = _cache_get(profile_text, home_id)
             if cached is not None:
                 return cached, None
-        else:
-            _cache_drop(profile_text)
+        elif not _cache_drop(profile_text):
+            # The old observation could not be removed: it must not survive a
+            # forced refresh, so no RPC runs and the caller refuses.
+            return None, _err("runtime_error", "quota_cache_drop_failed")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None, _err("timeout", "quota_rpc_deadline")
@@ -275,19 +277,17 @@ def _info_from_cache_entry(entry):
 
 
 def _cache_get(profile, home_id=None):
-    data = health.read_quota_cache()
-    entry = data.get(profile)
+    """The cached info of this profile alone; a missing, unreadable or
+    malformed file is no cached row (the probe then runs)."""
+    entry = health.get_quota_row(profile)
     if not _cache_fresh(entry) or (home_id is not None and entry.get("home_id") != home_id):
         return None
     return _info_from_cache_entry(entry)
 
 
 def _cache_drop(profile):
-    data = health.read_quota_cache()
-    if profile in data:
-        data = dict(data)
-        data.pop(profile, None)
-        health.write_quota_cache(data)
+    """True when the profile's file is gone (or was never there) and durably so."""
+    return health.drop_quota_row(profile)
 
 
 def _cache_put(profile, info, home_id=None):
@@ -312,9 +312,7 @@ def _cache_put(profile, info, home_id=None):
             "window_mins": secondary.get("window_mins"),
             "reached": bool(secondary.get("reached")),
         }
-    data = health.read_quota_cache()
-    data[profile] = stored
-    health.write_quota_cache(data)
+    health.put_quota_row(profile, stored)
     out = dict(info)
     out["checked_at"] = stored["checked_at"]
     return out
